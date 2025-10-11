@@ -16,7 +16,7 @@ class AtomicOrbital:
     orbital_type: int          # 轨道类型标识
     n_index: int               # 同一l下的轨道索引(如2s中的2, 3s中的3)
     r_grid: np.ndarray         # 径向网格
-    radial_function: np.ndarray # 径向波函数 R_nl(r)
+    radial_function: np.ndarray # 径向波函数 r*R_nl(r)
     
     def __post_init__(self):
         """初始化后处理，创建插值函数"""
@@ -267,7 +267,7 @@ def load_basis_set_from_file(filepath: str) -> BasisSet:
                 padded_func = np.zeros(parsed_data['mesh_size'])
                 padded_func[:len(radial_function)] = radial_function
                 radial_function = padded_func
-        
+        radial_function=radial_function*r_grid  # 转换为r*R形式
         # 为这个l值创建所有可能的m值轨道
         for m in range(-l, l + 1):
             atomic_orbital = AtomicOrbital(

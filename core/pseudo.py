@@ -2,7 +2,7 @@ import numpy as np
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 import xml.etree.ElementTree as ET
-
+from scipy.interpolate import interp1d
 @dataclass
 class BetaProjector:
     """
@@ -10,14 +10,13 @@ class BetaProjector:
     """
     l: int
     index: int
-    radial_function: np.ndarray
+    radial_function: interp1d
 
 @dataclass
 class Pseudopotential:
     """
     存储赝势所有信息的类。
     """
-    # --- 必填参数 (没有默认值) ---
     element: str
     z_valence: float
     l_max: int
@@ -25,11 +24,10 @@ class Pseudopotential:
     functional: str
     is_norm_conserving: bool
     r_grid: np.ndarray
-    v_local: np.ndarray
-    d_matrix: np.ndarray  # <-- 修正：将 d_matrix 移到有默认值的参数之前
+    v_local: interp1d
+    d_matrix: np.ndarray  #将 d_matrix 移到有默认值的参数之前
+    beta_projectors: List[BetaProjector]
 
-    # --- 可选参数 (有默认值) ---
-    beta_projectors: List[BetaProjector] = field(default_factory=list)
     rho_atomic: Optional[np.ndarray] = None
 
     def print_info(self):
@@ -43,7 +41,6 @@ class Pseudopotential:
         print(f"  Max Angular Momentum (l_max): {self.l_max}")
         print(f"  Radial Mesh Size: {self.mesh_size}")
         print(f"  Number of Projectors: {len(self.beta_projectors)}")
-        print(f"  Local Potential shape: {self.v_local.shape}")
         print(f"  D_ij Matrix shape: {self.d_matrix.shape}")
         print("="*50)
 
@@ -88,7 +85,8 @@ def load_pseudopotential_from_upf(filepath: str) -> Pseudopotential:
     
     # --- 3. 解析局域势 <PP_LOCAL> ---
     v_local_text = root.find('PP_LOCAL').text
-    v_local = np.fromstring(v_local_text, sep=' ')
+    v_local_value = np.fromstring(v_local_text, sep=' ')/2.0 #文件为Ry单位，转换为Hartree
+    v_local = interp1d(r_grid, v_local_value, kind='cubic', fill_value="extrapolate")
 
     # --- 4. 解析非局域投影 <PP_NONLOCAL> ---
     beta_projectors = []
@@ -98,8 +96,7 @@ def load_pseudopotential_from_upf(filepath: str) -> Pseudopotential:
         beta_l = int(beta_tag.attrib['angular_momentum'])
         beta_index = int(beta_tag.attrib['index'])
         beta_func_text = beta_tag.text
-        beta_radial_func = np.fromstring(beta_func_text, sep=' ')
-        
+        beta_radial_func = interp1d(r_grid,np.fromstring(beta_func_text, sep=' '), kind='cubic', fill_value="extrapolate")
         projector = BetaProjector(
             l=beta_l,
             index=beta_index,
@@ -109,7 +106,7 @@ def load_pseudopotential_from_upf(filepath: str) -> Pseudopotential:
 
     # --- 5. 解析 D_ij 矩阵 <PP_DIJ> ---
     d_matrix_text = root.find('PP_NONLOCAL/PP_DIJ').text
-    d_values = np.fromstring(d_matrix_text, sep=' ')
+    d_values = np.fromstring(d_matrix_text, sep=' ')/2.0 #文件为Ry单位，转换为Hartree
     d_matrix = d_values.reshape((num_projectors, num_projectors))
     
     # --- 6. (可选) 解析赝原子电荷密度 <PP_RHOATOM> ---

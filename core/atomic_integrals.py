@@ -46,7 +46,7 @@ class AtomicIntegrals:
         if nuclear_charge is not None:
             self.nuclear_charge = nuclear_charge
         else:
-            self.nuclear_charge = pseudo.z_valence
+            self.nuclear_charge = int(pseudo.z_valence)
         self.pseudo = pseudo
         # 预计算所有需要的数据以加速后续计算
         self._precompute_orbital_data()
@@ -66,7 +66,6 @@ class AtomicIntegrals:
         self.orbital_l = np.array([orb.l for orb in self.basis.orbitals], dtype=np.int32)
         self.orbital_m = np.array([orb.m for orb in self.basis.orbitals], dtype=np.int32)
         self.orbital_n = np.array([orb.n for orb in self.basis.orbitals], dtype=np.int32)
-        
         # 轨道名称
         self.orbital_names = [orb.orbital_name for orb in self.basis.orbitals]
     
@@ -77,24 +76,27 @@ class AtomicIntegrals:
         self.n_grid = len(self.r_grid)
         
         # 预计算常用的网格幂次和安全版本
-        self.r_squared = self.r_grid**2
+        # self.r_squared = self.r_grid**2
         self.r_safe = np.where(self.r_grid > 1e-12, self.r_grid, 1e-12)
+        self.r_inv_squared = 1.0 / (self.r_safe**2)
         
+        #TODO:这里可以优化到S积分计算时
         # 角动量选择矩阵：只有l和m都相同的轨道对才有非零积分
         self.angular_selection_matrix = (
             (self.orbital_l[:, np.newaxis] == self.orbital_l[np.newaxis, :]) & 
             (self.orbital_m[:, np.newaxis] == self.orbital_m[np.newaxis, :])
         )
-    
+
+
     def _precompute_derivatives(self):
         """预计算径向函数的导数"""
         self.radial_first_derivatives = np.array([
             np.gradient(R, self.dr) for R in self.radial_functions
         ])
         
-        self.radial_second_derivatives = np.array([
-            np.gradient(dR, self.dr) for dR in self.radial_first_derivatives
-        ])
+        # self.radial_second_derivatives = np.array([
+        #     np.gradient(dR, self.dr) for dR in self.radial_first_derivatives
+        # ])
     
     def _precompute_gaunt_coefficients(self):
         """预计算Gaunt系数"""
@@ -214,8 +216,7 @@ class AtomicIntegrals:
         # 构建被积函数矩阵 [n_basis, n_basis, n_grid]
         integrand_matrix = (
             self.radial_functions[:, np.newaxis, :] * 
-            self.radial_functions[np.newaxis, :, :] * 
-            self.r_squared[np.newaxis, np.newaxis, :]
+            self.radial_functions[np.newaxis, :, :]
         )
         
         S = np.array([
@@ -245,17 +246,21 @@ class AtomicIntegrals:
             for nu in range(self.n_basis):
                 if self.angular_selection_matrix[mu, nu]:
                     l_nu = self.orbital_l[nu]
+
+                    kinetic_integrand=(self.radial_first_derivatives[mu]*self.radial_first_derivatives[nu]*0.5+
+                                      0.5*l_nu * (l_nu + 1) *self.radial_functions[mu]* self.radial_functions[nu]*self.r_inv_squared
+                                      )
+                    T[mu, nu] = simpson(kinetic_integrand, x=self.r_grid)
+                    # # 动能算符作用在径向波函数上
+                    # kinetic_operator = (
+                    #     self.radial_second_derivatives[nu] + 
+                    #     (2.0 / self.r_safe) * self.radial_first_derivatives[nu] - 
+                    #     l_nu * (l_nu + 1) * self.radial_functions[nu] / (self.r_safe**2)
+                    # )
                     
-                    # 动能算符作用在径向波函数上
-                    kinetic_operator = (
-                        self.radial_second_derivatives[nu] + 
-                        (2.0 / self.r_safe) * self.radial_first_derivatives[nu] - 
-                        l_nu * (l_nu + 1) * self.radial_functions[nu] / (self.r_safe**2)
-                    )
-                    
-                    # 计算积分
-                    integrand = -0.5 * self.radial_functions[mu] * kinetic_operator * self.r_squared
-                    T[mu, nu] = simpson(integrand, x=self.r_grid)
+                    # # 计算积分
+                    # integrand = -0.5 * self.radial_functions[mu] * kinetic_operator
+                    # T[mu, nu] = simpson(integrand, x=self.r_grid)
         
         return T
     
@@ -273,11 +278,30 @@ class AtomicIntegrals:
         """
         logging.info("计算核吸引积分矩阵...")
         
-        # 构建被积函数矩阵：R_μ(r) * R_ν(r) * r  (注意：r²/r = r)
+        if self.pseudo is None:
+            return self._compute_nuclear_attraction_matrix_all_electrons(nuclear_charge)
+        else:
+            return self._compute_nuclear_attraction_matrix_pseudo()+self._compute_nuclear_attraction_matrix_pseudo_nonlocal()
+
+    def _compute_nuclear_attraction_matrix_all_electrons(self, nuclear_charge: int) -> np.ndarray:
+        """
+        计算全电子核吸引积分矩阵
+        
+        V_μν = ⟨φ_μ|-Z/r|φ_ν⟩ = -Z ∫ R_μ(r) R_ν(r) r dr
+        
+        Args:
+            nuclear_charge: 核电荷数
+            
+        Returns:
+            np.ndarray: 核吸引矩阵 [n_basis, n_basis]
+        """
+        logging.info("计算核吸引积分矩阵...")
+        
+        # 构建被积函数矩阵：R_μ(r) * R_ν(r) * r  
         integrand_matrix = (
             self.radial_functions[:, np.newaxis, :] * 
-            self.radial_functions[np.newaxis, :, :] * 
-            self.r_safe[np.newaxis, np.newaxis, :]
+            self.radial_functions[np.newaxis, :, :] 
+            /self.r_safe[np.newaxis, np.newaxis, :]
         )
         
         # 批量计算积分
@@ -288,8 +312,86 @@ class AtomicIntegrals:
         ])
         
         # 应用核电荷和角动量选择规则
-        return -nuclear_charge * V * self.angular_selection_matrix
+        return  -nuclear_charge * V * self.angular_selection_matrix
+    
+    
+    
+    def _compute_nuclear_attraction_matrix_pseudo(self) -> np.ndarray:
+        """
+        计算全电子核吸引积分矩阵
         
+        V_μν = ∫ R_μ(r)Vlocal(r) R_ν(r) r^2 dr
+
+        Args:
+            nuclear_charge: 核电荷数
+        Returns:
+            np.ndarray: 核吸引矩阵 [n_basis, n_basis]
+        """
+        logging.info("计算核吸引积分矩阵...")
+        
+        # 构建被积函数矩阵：R_μ(r)*Vlocal(r)* R_ν(r) * r^2
+        integrand_matrix = (
+            self.radial_functions[:, np.newaxis, :] * 
+            self.radial_functions[np.newaxis, :, :] * 
+            self.pseudo.v_local(self.r_grid)[np.newaxis, np.newaxis, :]
+        )
+        
+        # 批量计算积分
+        V = np.array([
+            [simpson(integrand_matrix[mu, nu], x=self.r_grid) 
+             for nu in range(self.n_basis)]
+            for mu in range(self.n_basis)
+        ])
+        
+        # 应用核电荷和角动量选择规则
+        return V * self.angular_selection_matrix
+
+    
+    def _compute_nuclear_attraction_matrix_pseudo_nonlocal(self) -> np.ndarray:
+        """
+        计算赝势非局域部分的核吸引积分矩阵
+        
+        V_μν^NL = Σ_ij ⟨φ_μ|β_i⟩ D_ij ⟨β_j|φ_ν⟩
+        
+        Returns:
+            np.ndarray: 非局域核吸引矩阵 [n_basis, n_basis]
+        """
+        logging.info("计算赝势非局域核吸引积分矩阵...")
+        
+        
+        n_basis = self.n_basis
+        n_projectors = len(self.pseudo.beta_projectors)
+        
+        # S_proj (n_basis x n_projectors) 矩阵，S_{μi} = ⟨φ_μ|β_i⟩
+        
+        S_proj = np.zeros((n_basis, n_projectors))
+        
+        # 遍历所有基函数 μ
+        for mu in range(n_basis):
+            orb_l = self.orbital_l[mu]
+            orb_m = self.orbital_m[mu]
+            
+            # 遍历所有投影函数 i
+            for i in range(n_projectors):
+                proj = self.pseudo.beta_projectors[i]
+                if orb_l == proj.l :
+                    # 径向积分: ∫ rR_μ(r) * rβ_i(r) dr
+                    integrand = self.radial_functions[mu] * proj.radial_function(self.r_grid)
+                    # 将计算结果存入 S_proj 矩阵
+                    S_proj[mu, i] = simpson(integrand, x=self.r_grid)
+
+
+        D_matrix = self.pseudo.d_matrix
+        print(D_matrix.shape)
+        print(S_proj.shape)
+    
+        #通过矩阵乘法构建完整的非局域矩阵 V_non_local ---
+        # V_NL = S_proj * D * S_proj^T
+        # (n_basis, n_proj) @ (n_proj, n_proj) -> (n_basis, n_proj)
+        # (n_basis, n_proj) @ (n_proj, n_basis) -> (n_basis, n_basis)
+        V_non_local_matrix = S_proj @ D_matrix @ S_proj.T
+        
+        return V_non_local_matrix
 
     def _compute_eri_element_k(self, mu, nu, lam, sig, max_k):
         """计算单个ERI元素，到max_k截断"""
@@ -369,8 +471,8 @@ class AtomicIntegrals:
     #     R3, R4 = self.radial_functions[lam], self.radial_functions[sig]
         
     #     # 预计算径向密度
-    #     rho1 = R1 * R2 * self.r_squared
-    #     rho2 = R3 * R4 * self.r_squared
+    #     rho1 = R1 * R2 
+    #     rho2 = R3 * R4
         
     #     # 使用自适应网格
     #     step = max(1, self.n_grid // (50 + 10*k))  # k越大，网格越密
@@ -405,8 +507,8 @@ class AtomicIntegrals:
         """
         # 1. 获取径向密度函数 rho(r) = R(r1)R(r2)r^2
         # rho1对应(mu, nu)，rho2对应(lam, sig)
-        rho1 = self.radial_functions[mu] * self.radial_functions[nu] * self.r_squared
-        rho2 = self.radial_functions[lam] * self.radial_functions[sig] * self.r_squared
+        rho1 = self.radial_functions[mu] * self.radial_functions[nu] 
+        rho2 = self.radial_functions[lam] * self.radial_functions[sig] 
 
         # 使用预先计算的安全r网格，避免除零
         r_safe = self.r_safe

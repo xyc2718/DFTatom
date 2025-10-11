@@ -60,8 +60,8 @@ def generate_gaussian_basis_set(
         integral_val = gamma((n_integral + 1) / 2) / (2 * a_integral**((n_integral + 1) / 2))
         N = 1.0 / np.sqrt(integral_val)
 
-        # 4. 在网格上生成数值径向函数
-        radial_function = N * (r_grid**l) * np.exp(-alpha * r_grid**2)
+        # 4. 在网格上生成数值径向函数r*R
+        radial_function = N * (r_grid**(l+1)) * np.exp(-alpha * r_grid**2)
         
         # 5. 创建并添加 AtomicOrbital 对象
         # 更新轨道索引 (n_index)，例如 1s, 2s, 2p, 3p...
