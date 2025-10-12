@@ -186,15 +186,16 @@ class AtomicIntegrals:
         """计算单个Gaunt系数"""
         if not self._check_selection_rules(l1, m1, l2, m2, l3, m3):
             return 0.0
-            
-        # coeff = math.sqrt((2*l2 + 1) * (2*l3 + 1)*(2*l1 + 1) / (4*math.pi))
-
+    
         if int(l1)!=l1 or int(l2)!=l2 or int(l3)!=l3 or int(m1)!=m1 or int(m2)!=m2 or int(m3)!=m3:
             logging.warning(f"gaunt系数遇到输入非整数值: l1={l1}, l2={l2}, l3={l3}, m1={m1}, m2={m2}, m3={m3}")
         else:
             l1=int(l1); l2=int(l2); l3=int(l3); m1=int(m1); m2=int(m2); m3=int(m3)
         
         return float(gaunt(l1, l2, l3,m1,m2, m3))
+            
+        # coeff = math.sqrt((2*l2 + 1) * (2*l3 + 1)*(2*l1 + 1) / (4*math.pi))
+
         # w1 = float(wigner_3j(l1, l2, l3, 0, 0, 0))
         # w2 = float(wigner_3j(l1, l2, l3, -m1, m2, m3))
         
@@ -232,7 +233,7 @@ class AtomicIntegrals:
         """
         计算动能积分矩阵
         
-        T_μν = ⟨φ_μ|-½∇²|φ_ν⟩ = -½ ∫ R_μ(r) [d²R_ν/dr² + (2/r)dR_ν/dr - l_ν(l_ν+1)R_ν/r²] r² dr
+        T_μν = ⟨φ_μ|-½∇²|φ_ν⟩ = -½ ∫ R_μ(r) [d²R_ν/dr² + (2/r)dR_ν/dr - l_ν(l_ν+1)R_ν/r²] r² dr = ∫ ½ drR_ν/dr drR_μ/dr - l_ν(l_ν+1)R_ν R_μdr
         
         Returns:
             np.ndarray: 动能矩阵 [n_basis, n_basis]
@@ -261,7 +262,6 @@ class AtomicIntegrals:
                     # # 计算积分
                     # integrand = -0.5 * self.radial_functions[mu] * kinetic_operator
                     # T[mu, nu] = simpson(integrand, x=self.r_grid)
-        
         return T
     
     def compute_nuclear_attraction_matrix(self, nuclear_charge: int) -> np.ndarray:

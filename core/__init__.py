@@ -2,4 +2,6 @@ from .atomic_integrals import *
 from .basis_set import *
 from .pseudo import *
 from .sto3g import *
+from .pseudo import *
 from .HF import *
+from .LSDA import *
