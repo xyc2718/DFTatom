@@ -29,7 +29,7 @@ class AtomicIntegrals:
     - 电子排斥积分（支持完整多极展开）
     """
 
-    def __init__(self, basis_set: BasisSet, nuclear_charge: int=None, pseudo: Pseudopotential=None,max_multipole=-1):
+    def __init__(self, basis_set: BasisSet, nuclear_charge: int=None, pseudo: Pseudopotential=None,max_multipole=-1,real_basis=False):
         """
         初始化积分计算器
         
@@ -40,6 +40,7 @@ class AtomicIntegrals:
         self.basis = basis_set
         self.n_basis = basis_set.get_orbital_count()
         self.max_multipole = max_multipole
+        self.real_basis=real_basis
         if nuclear_charge is None and pseudo is None:
             raise ValueError("必须提供核电荷数或赝势")
 
@@ -94,9 +95,6 @@ class AtomicIntegrals:
             np.gradient(R, self.dr) for R in self.radial_functions
         ])
         
-        # self.radial_second_derivatives = np.array([
-        #     np.gradient(dR, self.dr) for dR in self.radial_first_derivatives
-        # ])
     
     def _precompute_gaunt_coefficients(self):
         """预计算Gaunt系数"""
@@ -127,7 +125,12 @@ class AtomicIntegrals:
                         # 计算这个轨道组合的所有有效k值的Gaunt系数
                         for k in range(max_k + 1):
                             for mk in range(-k, k + 1):
-                                gaunt_coeff = self._compute_gaunt_coefficient_product(
+                                if self.real_basis:
+                                    gaunt_coeff = self._compute_gaunt_coefficient_product_real(
+                                    l1, m1, l2, m2, l3, m3, l4, m4, k, mk
+                                )
+                                else:
+                                    gaunt_coeff = self._compute_gaunt_coefficient_product(
                                     l1, m1, l2, m2, l3, m3, l4, m4, k, mk
                                 )
                                 if abs(gaunt_coeff) > 1e-12:
@@ -164,6 +167,24 @@ class AtomicIntegrals:
         
         return gaunt1 * gaunt2*((-1.0)**(m3+mk+m1))
     
+    def _compute_gaunt_coefficient_product_real(self, l1, m1, l2, m2, l3, m3, l4, m4, k, mk):
+        """
+        计算 ERI 所需的 Gaunt 系数乘积 (实球谐函数版本)。
+        公式：Sum_{q=-k}^{k} <l1 m1| l2 m2 | k q> * <l3 m3| l4 m4 | k q>
+        mk 参数在循环外部传入，代表多极矩 k 的分量 q
+        """
+        # 左边: Integral(S_{l1,m1} S_{l2,m2} S_{k,mk})
+        gaunt1 = self._compute_single_gaunt_coefficient_real(l1, m1, l2, m2, k, mk)
+        
+        if abs(gaunt1) < 1e-14:
+            return 0.0
+            
+        # 右边: Integral(S_{l3,m3} S_{l4,m4} S_{k,mk})
+        # 注意：实数展开中，中间项 S_{k,mk} 在左右两边是完全相同的实函数
+        gaunt2 = self._compute_single_gaunt_coefficient_real(l3, m3, l4, m4, k, mk)
+        
+        return gaunt1 * gaunt2
+    
     def _check_selection_rules(self, l1, m1, l2, m2, l3, m3):
         """检查Gaunt系数的选择定则"""
         # 磁量子数守恒
@@ -179,6 +200,71 @@ class AtomicIntegrals:
             return False
         
         return True
+    
+    def _get_gaunt_coeffs_real(self, l, m):
+        """
+        根据 ABACUS 定义，获取实数球谐函数 S_{lm} 对应的复数球谐函数 Y_{lk} 展开系数。
+        返回列表: [(k_index, coefficient), ...]
+        """
+        if m == 0:
+            return [(0, 1.0)]
+        
+        # 预计算常数
+        inv_sqrt2 = 1.0 / np.sqrt(2.0)
+        
+        if m > 0:
+            # S_{l,m} = sqrt(2) Re(Y_{l,m})
+            # = (1/sqrt(2)) * (Y_{l,m} + (-1)^m Y_{l,-m})
+            phase = (-1)**m
+            return [
+                (m, inv_sqrt2), 
+                (-m, phase * inv_sqrt2)
+            ]
+        else:
+            # m < 0
+            # S_{l,m} = sqrt(2) Im(Y_{l,|m|})
+            # = (1/i*sqrt(2)) * (Y_{l,|m|} - (-1)^|m| Y_{l,-|m|})
+            # = (-i/sqrt(2)) * Y_{l,|m|} + (i*(-1)^|m|/sqrt(2)) * Y_{l,-|m|}
+            abs_m = abs(m)
+            phase = (-1)**abs_m
+            return [
+                (abs_m, -1j * inv_sqrt2),
+                (-abs_m, 1j * phase * inv_sqrt2)
+            ]
+
+    @lru_cache(maxsize=100000)
+    def _compute_single_gaunt_coefficient_real(self, l1, m1, l2, m2, l3, m3):
+        """
+        计算实数球谐函数的 Gaunt 系数 (兼容 ABACUS)
+        Integral(S_{l1,m1} S_{l2,m2} S_{l3,m3})
+        """
+        # 1. 获取三个轨道的展开系数
+        coeffs1 = self._get_gaunt_coeffs_real(l1, m1)
+        coeffs2 = self._get_gaunt_coeffs_real(l2, m2)
+        coeffs3 = self._get_gaunt_coeffs_real(l3, m3)
+        
+        total_val = 0.0 + 0.0j
+        
+        # 2. 遍历所有组合进行线性叠加
+        for (k1, c1) in coeffs1:
+            for (k2, c2) in coeffs2:
+                for (k3, c3) in coeffs3:
+                    # 快速筛选：m量子数之和必须为0，否则积分为0
+                    if k1 + k2 + k3 != 0:
+                        continue
+                        
+                    # 调用 sympy 计算复数积分
+                    # gaunt 返回的是 integral(Y_l1k1 * Y_l2k2 * Y_l3k3)
+                    val = float(gaunt(l1, l2, l3, k1, k2, k3))
+                    
+                    if abs(val) > 1e-12:
+                        total_val += c1 * c2 * c3 * val
+        
+        # 3. 结果必须是实数（数值误差导致的微小虚部应被忽略）
+        if abs(total_val.imag) > 1e-10:
+            logging.warning(f"Warning: Real Gaunt coeff has imaginary part: {total_val}")
+        
+        return total_val.real
 
     
     @lru_cache(maxsize=1000)
@@ -194,13 +280,7 @@ class AtomicIntegrals:
         
         return float(gaunt(l1, l2, l3,m1,m2, m3))
             
-        # coeff = math.sqrt((2*l2 + 1) * (2*l3 + 1)*(2*l1 + 1) / (4*math.pi))
-
-        # w1 = float(wigner_3j(l1, l2, l3, 0, 0, 0))
-        # w2 = float(wigner_3j(l1, l2, l3, -m1, m2, m3))
-        
-        # return coeff * w1 * w2
-            
+    
 
     
     def compute_overlap_matrix(self) -> np.ndarray:
@@ -264,7 +344,7 @@ class AtomicIntegrals:
                     # T[mu, nu] = simpson(integrand, x=self.r_grid)
         return T
     
-    def compute_nuclear_attraction_matrix(self, nuclear_charge: int) -> np.ndarray:
+    def compute_nuclear_attraction_matrix(self) -> np.ndarray:
         """
         计算核吸引积分矩阵
         
@@ -279,7 +359,7 @@ class AtomicIntegrals:
         logging.info("计算核吸引积分矩阵...")
         
         if self.pseudo is None:
-            return self._compute_nuclear_attraction_matrix_all_electrons(nuclear_charge)
+            return self._compute_nuclear_attraction_matrix_all_electrons(self.nuclear_charge)
         else:
             return self._compute_nuclear_attraction_matrix_pseudo()+self._compute_nuclear_attraction_matrix_pseudo_nonlocal()
 
@@ -464,39 +544,6 @@ class AtomicIntegrals:
         maxk=min(self.max_multipole, 2 * np.max(self.orbital_l)) if self.max_multipole>=0 else 2 * np.max(self.orbital_l)
         return self._compute_eri_k(maxk)
 
-    
-    # def _compute_radial_multipole_integral(self, mu, nu, lam, sig, k):
-    #     """计算k阶多极展开的径向积分"""
-    #     R1, R2 = self.radial_functions[mu], self.radial_functions[nu]
-    #     R3, R4 = self.radial_functions[lam], self.radial_functions[sig]
-        
-    #     # 预计算径向密度
-    #     rho1 = R1 * R2 
-    #     rho2 = R3 * R4
-        
-    #     # 使用自适应网格
-    #     step = max(1, self.n_grid // (50 + 10*k))  # k越大，网格越密
-        
-    #     integral = 0.0
-        
-    #     for i in range(0, self.n_grid, step):
-    #         r1 = self.r_grid[i]
-    #         for j in range(0, self.n_grid, step):
-    #             r2 = self.r_grid[j]
-                
-    #             if r1 < 1e-12 or r2 < 1e-12:
-    #                 continue
-                
-    #             # 计算多极因子
-    #             r_min = min(r1, r2)
-    #             r_max = max(r1, r2)
-                
-    #             if r_max > 1e-12:
-    #                 multipole_factor = (r_min**k) / (r_max**(k+1))
-    #                 integrand = rho1[i] * rho2[j] * multipole_factor
-    #                 integral += integrand
-        
-    #     return integral * (self.dr * step)**2
 
 
     @lru_cache(maxsize=100000)
@@ -627,7 +674,7 @@ class AtomicIntegrals:
         
         return analysis
     
-    def compute_core_hamiltonian(self, nuclear_charge: int) -> np.ndarray:
+    def compute_core_hamiltonian(self) -> np.ndarray:
         """
         计算核心哈密顿矩阵
         
@@ -640,10 +687,10 @@ class AtomicIntegrals:
             np.ndarray: 核心哈密顿矩阵
         """
         T = self.compute_kinetic_matrix()
-        V = self.compute_nuclear_attraction_matrix(nuclear_charge)
+        V = self.compute_nuclear_attraction_matrix()
         return T + V
     
-    def compute_all_integrals(self, nuclear_charge: int) -> Dict[str, np.ndarray]:
+    def compute_all_integrals(self) -> Dict[str, np.ndarray]:
         """
         计算所有需要的积分
         
@@ -653,7 +700,7 @@ class AtomicIntegrals:
         Returns:
             Dict: 包含所有积分矩阵的字典
         """
-        logging.info(f"开始计算所有积分 (核电荷 = {nuclear_charge}, ERI max multipole = {self.max_multipole})...")
+        logging.info(f"开始计算所有积分 (核电荷 = {self.nuclear_charge}, ERI max multipole = {self.max_multipole})...")
         start_time = time.time()
         
         integrals = {}
@@ -661,7 +708,7 @@ class AtomicIntegrals:
         # 计算单电子积分
         integrals['overlap'] = self.compute_overlap_matrix()
         integrals['kinetic'] = self.compute_kinetic_matrix()
-        integrals['nuclear'] = self.compute_nuclear_attraction_matrix(nuclear_charge)
+        integrals['nuclear'] = self.compute_nuclear_attraction_matrix()
         integrals['core_hamiltonian'] = integrals['kinetic'] + integrals['nuclear']
         
         # 计算双电子积分
@@ -701,7 +748,7 @@ class AtomicIntegrals:
         if len(nonzero_eri) > 0:
             print(f"  数值范围: {np.min(nonzero_eri):.6f} ~ {np.max(nonzero_eri):.6f}")
 
-def calculate_atomic_integrals(basis_set, nuclear_charge: int, max_multipole=-1) -> Dict[str, np.ndarray]:
+def calculate_atomic_integrals(basis_set, max_multipole=-1) -> Dict[str, np.ndarray]:
     """
     计算原子的所有积分
     
@@ -714,7 +761,7 @@ def calculate_atomic_integrals(basis_set, nuclear_charge: int, max_multipole=-1)
         Dict: 所有积分矩阵
     """
     integral_calc = AtomicIntegrals(basis_set, max_multipole=max_multipole)
-    integrals = integral_calc.compute_all_integrals(nuclear_charge)
-    integral_calc.logging.info_integral_summary(integrals)
+    integrals = integral_calc.compute_all_integrals()
+    integral_calc.print_integral_summary(integrals)
     return integrals
 

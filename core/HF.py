@@ -74,7 +74,7 @@ class AtomicHartreeFock:
         logging.info(f"电子配置: {self.n_alpha}α + {self.n_beta}β = {self.n_electrons}")
         logging.info(f"自旋多重度: {self.multiplicity}")
 
-        self.integrals = self.integral_calc.compute_all_integrals(self.n_electrons)
+        self.integrals = self.integral_calc.compute_all_integrals()
 
         logging.info(f"积分计算完成，开始SCF迭代...")
 
@@ -111,7 +111,7 @@ class AtomicHartreeFock:
     
     def run_scf(self) -> HFResults:
         """执行自洽场计算"""
-        logging.info(f"\n开始SCF迭代...")
+        logging.info(f"\n开始Hartree-Fock SCF迭代...")
         logging.info(f"收敛阈值: 能量 < {self.energy_threshold:.2e}, 密度 {self.density_threshold:.2e}")
 
         # 获取积分矩阵
@@ -179,7 +179,7 @@ class AtomicHartreeFock:
             fock_matrix_alpha=F_alpha,
             fock_matrix_beta=F_beta,
             electron_configuration=electron_config,
-            integral_calc=self.integral_calc
+            integral_calc=self.integral_calc,
         )
     
     def _initial_guess(self, S: np.ndarray, H_core: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
