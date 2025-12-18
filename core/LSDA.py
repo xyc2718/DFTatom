@@ -153,6 +153,8 @@ class KSResults:
     electron_configuration: Dict
     integral_calc: AtomicIntegrals
     energies: Dict[str, float]
+    occ_alpha: float
+    occ_beta: float
 
 class AtomicLSDA:
     """
@@ -272,7 +274,8 @@ class AtomicLSDA:
             density_matrix_alpha=P_alpha, density_matrix_beta=P_beta,
             ks_matrix_alpha=K_alpha, ks_matrix_beta=K_beta,
             electron_configuration=electron_config, integral_calc=self.integral_calc,
-            energies=energies
+            energies=energies,
+            occ_alpha=occ_alpha, occ_beta=occ_beta
         )
 
     def _calculate_electron_density_on_grid(self, P: np.ndarray) -> np.ndarray:
@@ -281,7 +284,7 @@ class AtomicLSDA:
         # 径向密度: rho_radial(r) = r² |R(r)|² = |χ(r)|²
         # 所以: Σ P_mn χ_m χ_n = rho_radial
         #
-        # 重要：只有相同角动量量子数(l,m)的轨道对才对球对称平均密度有贡献
+        # 只有相同角动量量子数(l,m)的轨道对才对球对称平均密度有贡献
         # 因为不同m的球谐函数正交: ∫ Y_lm × Y_lm' dΩ = δ_mm'
         # 因此需要应用angular_selection_matrix来过滤
         radial_funcs = self.integral_calc.radial_functions

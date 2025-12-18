@@ -175,7 +175,10 @@ def plot_orbital_contour(results: CalculationResults, orbital_index: int, spin='
     
     cf = plt.contourf(X, Y, Psi_plot, levels=levels, cmap='RdBu_r')
     cbar = plt.colorbar(cf)
-    cbar.set_label('Wavefunction Amplitude (a.u.)', rotation=270, labelpad=15)
+    if is_real_basis:
+        cbar.set_label('Wavefunction Amplitude (a.u.)', rotation=270, labelpad=15)
+    else:
+        cbar.set_label('Real Part of Wavefunction Amplitude (a.u.)', rotation=270, labelpad=15)
     
     plt.scatter([0], [0], marker='+', color='black', s=80, alpha=0.7, label='Nucleus')
     plt.contour(X, Y, Psi_plot, levels=[0], colors='black', linewidths=0.5, alpha=0.3)
@@ -184,9 +187,13 @@ def plot_orbital_contour(results: CalculationResults, orbital_index: int, spin='
     max_c_idx = np.argmax(np.abs(coeffs))
     orb_label_guess = orbital_names[max_c_idx]
     title_spin = r"$\alpha$" if spin=='alpha' else r"$\beta$"
-    
-    plt.title(f"Orbital {orbital_index}: {orb_label_guess} ({title_spin})\n"
+    if is_real_basis:
+        
+        plt.title(f"Orbital {orbital_index}: {orb_label_guess} ({title_spin})\n"
               f"E = {energy:.4f} Ha | Plane: {plane}")
+    else:
+        plt.title(f"Real part of Orbital {orbital_index}: {orb_label_guess} ({title_spin})\n"
+              f"E = {energy:.4f} Ha | Plane: {plane} | Complex Spherical Harmonics")
     plt.xlabel(f"{plane[0].upper()} (Bohr)")
     plt.ylabel(f"{plane[1].upper()} (Bohr)")
     plt.axis('equal') # 保证圆形不变形

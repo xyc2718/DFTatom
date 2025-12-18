@@ -75,7 +75,7 @@ def generate_gaussian_basis_set(
             l=l,
             m=m,
             orbital_type=l, # 用 l 作为类型标识
-            n_index=n_index,
+            n_index=n_index-1,
             r_grid=r_grid.copy(),
             radial_function=radial_function.copy()
         )
@@ -159,7 +159,7 @@ def get_basis_params_from_file(atomic_symbol: str) -> list[dict]:
                         'alpha': alpha
                     })
 
-    return basis_functions
+    return basis_functions[::-1]
 
 def get_sto3g_basis(atomic_symbol: str, radius_cutoff: float = 7.0,
     mesh_size: int = 701 ) -> BasisSet:

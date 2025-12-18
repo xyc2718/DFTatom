@@ -29,6 +29,8 @@ class HFResults:
     fock_matrix_beta: np.ndarray
     electron_configuration: Dict
     integral_calc:AtomicIntegrals
+    occ_alpha: np.ndarray
+    occ_beta: np.ndarray
 
 class AtomicHartreeFock:
     """
@@ -165,7 +167,10 @@ class AtomicHartreeFock:
         
         # 返回结果
         electron_config = self._analyze_electron_configuration(eps_alpha, eps_beta, C_alpha, C_beta)
-        
+        occ_alpha = np.zeros_like(eps_alpha)
+        occ_alpha[:self.n_alpha] = 1.0
+        occ_beta = np.zeros_like(eps_beta)
+        occ_beta[:self.n_beta] = 1.0
         return HFResults(
             converged=converged,
             iterations=iteration + 1,
@@ -180,6 +185,8 @@ class AtomicHartreeFock:
             fock_matrix_beta=F_beta,
             electron_configuration=electron_config,
             integral_calc=self.integral_calc,
+            occ_alpha=occ_alpha,
+            occ_beta=occ_beta
         )
     
     def _initial_guess(self, S: np.ndarray, H_core: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:

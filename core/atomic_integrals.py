@@ -427,51 +427,100 @@ class AtomicIntegrals:
         return V * self.angular_selection_matrix
 
     
+    # def _compute_nuclear_attraction_matrix_pseudo_nonlocal(self) -> np.ndarray:
+    #     """
+    #     计算赝势非局域部分的核吸引积分矩阵
+        
+    #     V_μν^NL = Σ_ij ⟨φ_μ|β_i⟩ D_ij ⟨β_j|φ_ν⟩
+        
+    #     Returns:
+    #         np.ndarray: 非局域核吸引矩阵 [n_basis, n_basis]
+    #     """
+    #     logging.info("计算赝势非局域核吸引积分矩阵...")
+        
+        
+    #     n_basis = self.n_basis
+    #     n_projectors = len(self.pseudo.beta_projectors)
+        
+    #     # S_proj (n_basis x n_projectors) 矩阵，S_{μi} = ⟨φ_μ|β_i⟩
+        
+    #     S_proj = np.zeros((n_basis, n_projectors))
+        
+    #     # 遍历所有基函数 μ
+    #     for mu in range(n_basis):
+    #         orb_l = self.orbital_l[mu]
+    #         orb_m = self.orbital_m[mu]
+            
+    #         # 遍历所有投影函数 i
+    #         for i in range(n_projectors):
+    #             proj = self.pseudo.beta_projectors[i]
+    #             if orb_l == proj.l :
+    #                 # 径向积分: ∫ rR_μ(r) * rβ_i(r) dr
+    #                 integrand = self.radial_functions[mu] * proj.radial_function(self.r_grid)
+    #                 # 将计算结果存入 S_proj 矩阵
+    #                 S_proj[mu, i] = simpson(integrand, x=self.r_grid)
+
+
+    #     D_matrix = self.pseudo.d_matrix
+    #     print(D_matrix.shape)
+    #     print(S_proj.shape)
+    
+    #     #通过矩阵乘法构建完整的非局域矩阵 V_non_local ---
+    #     # V_NL = S_proj * D * S_proj^T
+    #     # (n_basis, n_proj) @ (n_proj, n_proj) -> (n_basis, n_proj)
+    #     # (n_basis, n_proj) @ (n_proj, n_basis) -> (n_basis, n_basis)
+    #     V_non_local_matrix = S_proj @ D_matrix @ S_proj.T
+        
+    #     return V_non_local_matrix
+
     def _compute_nuclear_attraction_matrix_pseudo_nonlocal(self) -> np.ndarray:
         """
-        计算赝势非局域部分的核吸引积分矩阵
-        
-        V_μν^NL = Σ_ij ⟨φ_μ|β_i⟩ D_ij ⟨β_j|φ_ν⟩
-        
-        Returns:
-            np.ndarray: 非局域核吸引矩阵 [n_basis, n_basis]
+        计算修正后的赝势非局域部分积分矩阵
+        确保每个 m 分量独立投影，维持球对称性和简并度
         """
-        logging.info("计算赝势非局域核吸引积分矩阵...")
-        
+        logging.info("计算赝势非局域核吸引积分矩阵 (支持 m 分量独立投影)...")
         
         n_basis = self.n_basis
         n_projectors = len(self.pseudo.beta_projectors)
+        V_nl = np.zeros((n_basis, n_basis))
         
-        # S_proj (n_basis x n_projectors) 矩阵，S_{μi} = ⟨φ_μ|β_i⟩
-        
-        S_proj = np.zeros((n_basis, n_projectors))
-        
-        # 遍历所有基函数 μ
-        for mu in range(n_basis):
-            orb_l = self.orbital_l[mu]
-            orb_m = self.orbital_m[mu]
-            
-            # 遍历所有投影函数 i
-            for i in range(n_projectors):
-                proj = self.pseudo.beta_projectors[i]
-                if orb_l == proj.l :
-                    # 径向积分: ∫ rR_μ(r) * rβ_i(r) dr
-                    integrand = self.radial_functions[mu] * proj.radial_function(self.r_grid)
-                    # 将计算结果存入 S_proj 矩阵
-                    S_proj[mu, i] = simpson(integrand, x=self.r_grid)
+        D_matrix = self.pseudo.d_matrix # 形状为 (n_proj, n_proj)
 
-
-        D_matrix = self.pseudo.d_matrix
-        print(D_matrix.shape)
-        print(S_proj.shape)
-    
-        #通过矩阵乘法构建完整的非局域矩阵 V_non_local ---
-        # V_NL = S_proj * D * S_proj^T
-        # (n_basis, n_proj) @ (n_proj, n_proj) -> (n_basis, n_proj)
-        # (n_basis, n_proj) @ (n_proj, n_basis) -> (n_basis, n_basis)
-        V_non_local_matrix = S_proj @ D_matrix @ S_proj.T
-        
-        return V_non_local_matrix
+        # 遍历 D 矩阵中的所有径向耦合项 (i, j)
+        for i in range(n_projectors):
+            proj_i = self.pseudo.beta_projectors[i]
+            for j in range(n_projectors):
+                d_ij = D_matrix[i, j]
+                
+                # 只有当 Dij 非零且两个投影器的角动量 l 相同时才有物理贡献
+                if abs(d_ij) < 1e-12 or proj_i.l != self.pseudo.beta_projectors[j].l:
+                    continue
+                
+                proj_j = self.pseudo.beta_projectors[j]
+                l = proj_i.l
+                
+                # --- 关键步骤：对该 l 下的所有 m 分量独立求和 ---
+                # 算符形式: V_NL = Σ_m |β_i Y_lm> D_ij <β_j Y_lm|
+                for m in range(-l, l + 1):
+                    # 构建该 (l, m) 通道下的投影向量 (n_basis,)
+                    # vec_i[μ] = <φ_μ | β_i Y_lm>
+                    vec_i = np.zeros(n_basis)
+                    vec_j = np.zeros(n_basis)
+                    
+                    for mu in range(n_basis):
+                        # 只有轨道量子数匹配时，积分才不为 0
+                        if self.orbital_l[mu] == l and self.orbital_m[mu] == m:
+                            # 径向积分: ∫ χ_μ(r) * rβ_i(r) dr (假设 β_i 已是 r*β)
+                            integrand_i = self.radial_functions[mu] * proj_i.radial_function(self.r_grid)
+                            vec_i[mu] = simpson(integrand_i, x=self.r_grid)
+                            
+                            integrand_j = self.radial_functions[mu] * proj_j.radial_function(self.r_grid)
+                            vec_j[mu] = simpson(integrand_j, x=self.r_grid)
+                    
+                    # 将该 m 分量的贡献以外积形式加入总矩阵
+                    V_nl += d_ij * np.outer(vec_i, vec_j)
+                    
+        return V_nl
 
     def _compute_eri_element_k(self, mu, nu, lam, sig, max_k):
         """计算单个ERI元素，到max_k截断"""
