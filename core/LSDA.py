@@ -161,18 +161,22 @@ class AtomicLSDA:
     自旋极化原子Kohn-Sham LSDA计算类
     实现基于完整SVWN5泛函的自洽场计算
     """
-
     def __init__(self, integral_calc: AtomicIntegrals, n_electrons: int = None,
                  multiplicity: int = None,
                  max_iterations: int = 100,
                  energy_threshold: float = 1e-8,
                  density_threshold: float = 1e-6,
-                 damping_factor: float = 0.5):
+                 damping_factor: float = 0.5,
+                 strict_diagonalize: bool = False,
+                 diagonalization_threshold: float = 1e-6,
+                 temperature: float = 0.005):
         self.integral_calc = integral_calc
         self.n_electrons = n_electrons or self.integral_calc.nuclear_charge
         self.n_basis = self.integral_calc.n_basis
         self.r_grid = self.integral_calc.r_grid
         self.r_squared = self.integral_calc.r_grid**2
+        self.strict_diagonalize= strict_diagonalize
+        self.diagonalization_threshold = diagonalization_threshold
         
         self.multiplicity = multiplicity or self._get_ground_state_multiplicity_default()
         if self.multiplicity is None or self.multiplicity < 1:
@@ -183,18 +187,24 @@ class AtomicLSDA:
         self.energy_threshold = energy_threshold
         self.density_threshold = density_threshold
         self.damping_factor = damping_factor
+        self.temperature = temperature
 
-        logging.info("初始化LSDA计算 (完整SVWN5泛函):")
+        logging.info("初始化LSDA计算:")
         logging.info(f"基组数量: {self.n_basis}")
         logging.info(f"电子数: {self.n_electrons}")
         logging.info(f"电子配置: {self.n_alpha}α + {self.n_beta}β = {self.n_electrons}")
         logging.info(f"自旋多重度: {self.multiplicity}")
+        logging.info(f"最大迭代次数: {self.max_iterations}")
+        logging.info(f"能量收敛阈值: {self.energy_threshold}")
+        logging.info(f"密度收敛阈值: {self.density_threshold}")
+        logging.info(f"阻尼因子: {self.damping_factor}")
+        logging.info(f"温度 (用于费米-狄拉克占据): {self.temperature}")
         
         self.S = self.integral_calc.compute_overlap_matrix()
         self.T = self.integral_calc.compute_kinetic_matrix()
         self.V_nuc = self.integral_calc.compute_nuclear_attraction_matrix()
         self.H_core = self.T + self.V_nuc
-        self.eri = self.integral_calc.compute_electron_repulsion_integrals()
+        self.eri= self.integral_calc.compute_electron_repulsion_integrals()
         
         logging.info("单电子积分计算完成，开始SCF迭代...")
     
@@ -209,11 +219,63 @@ class AtomicLSDA:
         n_beta = self.n_electrons - n_alpha
         return n_alpha, n_beta
 
+    def _strict_diagonalize(self, H, S, threshold=1e-5):
+            """
+            求解广义本征值问题 HC = SCe，处理线性相关性。
+            
+            关键修正：为了保持矩阵形状一致性 (n_basis, n_basis)，
+            我们将被剔除的线性相关轨道的系数设为 0，能量设为极大值 (10000 Ha)。
+            这样外部代码 (如 run_scf) 就不需要修改形状逻辑。
+            """
+            # 1. 对角化重叠矩阵 S
+            s_vals, U = eigh(S)
+            
+            # 2. 检测线性相关性
+            mask = s_vals > threshold
+            
+            # if np.sum(mask) < len(s_vals):
+            #     logging.debug(f"剔除线性相关基函数: {len(s_vals)} -> {np.sum(mask)}")
+                
+            s_reg = s_vals[mask]
+            U_reg = U[:, mask]
+            
+            # 3. 正则正交化 (Canonical Orthogonalization)
+            # 构造变换矩阵 X = U * s^(-1/2)
+            X = U_reg / np.sqrt(s_reg)
+            
+            # 变换哈密顿量: H' = X.T * H * X
+            H_prime = X.T @ H @ X
+            
+            # 求解子空间内的本征值
+            eps_reg, C_prime = eigh(H_prime)
+            
+            # 变换回原子轨道基组: C_valid = X * C'
+            # C_valid 的形状是 (n_basis, n_valid_mo)
+            C_valid = X @ C_prime
+            
+            # --- 关键：恢复矩阵形状 (Padding) ---
+            n_basis = H.shape[0]
+            n_valid = C_valid.shape[1]
+            
+            # 1. 填充能量：将无效轨道的能量设为 10000.0 (远高于费米面，确保不被占据)
+            eps_full = np.full(n_basis, 10000.0)
+            eps_full[:n_valid] = eps_reg
+            
+            # 2. 填充系数：将无效轨道的系数设为 0.0
+            C_full = np.zeros((n_basis, n_basis))
+            C_full[:, :n_valid] = C_valid
+            
+            return eps_full, C_full
+    def _solve_ks_equation(self, K: np.ndarray, S: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        if self.strict_diagonalize:
+            return self._strict_diagonalize(K, S)
+        else:
+            return eigh(K, S)
     def run_scf(self) -> KSResults:
         logging.info(f"\n开始LSDA SCF迭代...")
         logging.info(f"收敛阈值: 能量 < {self.energy_threshold:.2e}, 密度 < {self.density_threshold:.2e}")
 
-        _, C_guess = eigh(self.H_core, self.S)
+        _, C_guess = self._solve_ks_equation(self.H_core, self.S)
         # 构造简单的初始占据 (alpha)
         occ_alpha_guess = np.zeros(self.n_basis)
         occ_alpha_guess[:self.n_alpha] = 1.0
@@ -237,7 +299,7 @@ class AtomicLSDA:
             eps_alpha, C_alpha = self._solve_ks_equation(K_alpha, self.S)
             eps_beta, C_beta = self._solve_ks_equation(K_beta, self.S)
 
-            smearing_temp = 0.005 
+            smearing_temp = self.temperature 
             occ_alpha = self._compute_occupations(eps_alpha, self.n_alpha, temperature=smearing_temp)
             occ_beta = self._compute_occupations(eps_beta, self.n_beta, temperature=smearing_temp)
 
