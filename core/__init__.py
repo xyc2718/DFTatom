@@ -6,3 +6,4 @@ from .pseudo import *
 from .HF import *
 from .LSDA import *
 from .visualization import *
+from .pseudo_gen import *

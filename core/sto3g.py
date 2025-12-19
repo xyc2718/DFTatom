@@ -9,6 +9,9 @@ from pathlib import Path
 
 
 STO3GPATH=Path(__file__).parent / "sto-3g.gbs"
+STO6GPATH=Path(__file__).parent / "sto-6g.gbs"
+AUGCCPVTZPATH=Path(__file__).parent / "aug-cc-pvtz.gbs"
+ANORCCVQZPPATH=Path(__file__).parent / "ano-rcc-vqzp.gbs"
 
 def generate_gaussian_basis_set(
     element: str,
@@ -84,7 +87,8 @@ def generate_gaussian_basis_set(
     return basis_set
 
 
-def get_basis_params_from_file(atomic_symbol: str) -> list[dict]:
+
+def get_basis_params_from_file(atomic_symbol: str,basis_file_path=STO3GPATH) -> list[dict]:
     """
     从 STO3GPATH 环境变量指定的文件中加载并解析指定原子的 STO-3G 基组参数。
 
@@ -99,7 +103,6 @@ def get_basis_params_from_file(atomic_symbol: str) -> list[dict]:
         FileNotFoundError: 如果 STO3GPATH 指向的文件不存在。
     """
 
-    basis_file_path=STO3GPATH
     # 2. 读取和解析文件
     atom_data = []
     found_atom = False
@@ -177,6 +180,53 @@ def get_sto3g_basis(atomic_symbol: str, radius_cutoff: float = 7.0,
     basis_set = generate_gaussian_basis_set(atomic_symbol, primitives, radius_cutoff, mesh_size)
     return basis_set
 
+def get_sto6g_basis(atomic_symbol: str, radius_cutoff: float = 10.0,
+    mesh_size: int = 701 ) -> BasisSet:
+    """
+    获取指定原子的 STO-3G 基组，并生成对应的 BasisSet 对象。
+
+    Args:
+        atomic_symbol: 原子的化学符号 (例如, 'H', 'C', 'Ti')。
+        radius_cutoff: 径向网格的最大半径 (Bohr)。
+        mesh_size: 径向网格的点数。
+    Returns:
+        一个填充了数值原子轨道的 BasisSet 对象。
+    """
+    primitives = get_basis_params_from_file(atomic_symbol,basis_file_path=STO6GPATH)
+    basis_set = generate_gaussian_basis_set(atomic_symbol, primitives, radius_cutoff, mesh_size)
+    return basis_set
+def get_aug_cc_pvtz_basis(atomic_symbol: str, radius_cutoff: float = 10.0,
+    mesh_size: int = 701 ) -> BasisSet:
+    """
+    获取指定原子的 STO-3G 基组，并生成对应的 BasisSet 对象。
+
+    Args:
+        atomic_symbol: 原子的化学符号 (例如, 'H', 'C', 'Ti')。
+        radius_cutoff: 径向网格的最大半径 (Bohr)。
+        mesh_size: 径向网格的点数。
+    Returns:
+        一个填充了数值原子轨道的 BasisSet 对象。
+    """
+    primitives = get_basis_params_from_file(atomic_symbol,basis_file_path=AUGCCPVTZPATH)
+    basis_set = generate_gaussian_basis_set(atomic_symbol, primitives, radius_cutoff, mesh_size)
+    return basis_set
+
+def get_ano_rcc_vqzp_basis(atomic_symbol: str, radius_cutoff: float = 10.0,
+    mesh_size: int = 701 ) -> BasisSet:
+    """
+    获取指定原子的 STO-3G 基组，并生成对应的 BasisSet 对象。
+
+    Args:
+        atomic_symbol: 原子的化学符号 (例如, 'H', 'C', 'Ti')。
+        radius_cutoff: 径向网格的最大半径 (Bohr)。
+        mesh_size: 径向网格的点数。
+
+    Returns:
+        一个填充了数值原子轨道的 BasisSet 对象。
+    """
+    primitives = get_basis_params_from_file(atomic_symbol,basis_file_path=ANORCCVQZPPATH)
+    basis_set = generate_gaussian_basis_set(atomic_symbol, primitives, radius_cutoff, mesh_size)
+    return basis_set
 
 # --- 使用示例 ---
 if __name__ == '__main__':
