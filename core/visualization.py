@@ -11,6 +11,29 @@ try:
 except ImportError:
     CalculationResults = "Any"  # 仅作类型提示占位
 
+
+def get_radial_data(res, spin, orb_idx):
+    """从结果对象中提取 R(r) 数据，辅助函数"""
+    calc = res.integral_calc
+    r = calc.r_grid
+    
+    # 获取系数
+    C = res.coefficients_alpha if spin == 'alpha' else res.coefficients_beta
+    coeffs = C[:, orb_idx]
+    
+    # 组合波函数: psi_chi = sum(c * chi)
+    psi_chi = np.einsum('m,mr->r', coeffs, calc.radial_functions)
+    
+    # 转换为 R(r) = chi/r，处理原点
+    with np.errstate(divide='ignore', invalid='ignore'):
+        psi_r = psi_chi / r
+        # 简单修补原点
+        if np.abs(r[0]) < 1e-9:
+            psi_r[0] = psi_r[1]
+            
+    return r, psi_r
+
+
 def plot_radial_wavefunctions(results: CalculationResults, spin='alpha', max_r=5.0):
     """
     绘制 1D 径向波函数 R(r)

@@ -155,6 +155,8 @@ class KSResults:
     energies: Dict[str, float]
     occ_alpha: float
     occ_beta: float
+    total_potential_alpha: np.ndarray = None
+    total_potential_beta: np.ndarray = None
 
 class AtomicLSDA:
     """
@@ -169,6 +171,7 @@ class AtomicLSDA:
                  damping_factor: float = 0.5,
                  strict_diagonalize: bool = False,
                  diagonalization_threshold: float = 1e-6,
+                 occ_method: str = 'fermi',  # 'fermi' or 'aufbau' or else
                  temperature: float = 0.005):
         self.integral_calc = integral_calc
         self.n_electrons = n_electrons or self.integral_calc.nuclear_charge
@@ -188,7 +191,7 @@ class AtomicLSDA:
         self.density_threshold = density_threshold
         self.damping_factor = damping_factor
         self.temperature = temperature
-
+        self.occ_method = occ_method
         logging.info("初始化LSDA计算:")
         logging.info(f"基组数量: {self.n_basis}")
         logging.info(f"电子数: {self.n_electrons}")
@@ -198,7 +201,13 @@ class AtomicLSDA:
         logging.info(f"能量收敛阈值: {self.energy_threshold}")
         logging.info(f"密度收敛阈值: {self.density_threshold}")
         logging.info(f"阻尼因子: {self.damping_factor}")
-        logging.info(f"温度 (用于费米-狄拉克占据): {self.temperature}")
+        if self.occ_method == 'fermi':
+            logging.info("使用费米-狄拉克分布计算占据数")
+            logging.info(f"温度 (用于费米-狄拉克占据): {self.temperature}")
+        elif self.occ_method == 'aufbau':
+            logging.info("使用Aufbau方法占据")
+        else:
+            logging.info("未知方法,使用默认占据")
         
         self.S = self.integral_calc.compute_overlap_matrix()
         self.T = self.integral_calc.compute_kinetic_matrix()
@@ -209,7 +218,9 @@ class AtomicLSDA:
         logging.info("单电子积分计算完成，开始SCF迭代...")
     
     def _get_ground_state_multiplicity_default(self) -> int:
-        multiplicities = {"H": 2, "He": 1, "Li": 2, "Be": 1, "B": 2, "C": 3, "N": 4, "O": 3, "F": 2, "Ne": 1}
+        multiplicities = {"H": 2, "He": 1, "Li": 2, "Be": 1, "B": 2, "C": 3, "N": 4, "O": 3, "F": 2, "Ne": 1,"Al":2}
+        if self.integral_calc.basis.element not in multiplicities:
+            logging.warning("无法确定默认自旋多重度，请手动指定。")
         return multiplicities.get(self.integral_calc.basis.element, 1)
 
     def _determine_electron_numbers(self) -> Tuple[int, int]:
@@ -279,12 +290,13 @@ class AtomicLSDA:
         # 构造简单的初始占据 (alpha)
         occ_alpha_guess = np.zeros(self.n_basis)
         occ_alpha_guess[:self.n_alpha] = 1.0
+        occ_alpha=occ_alpha_guess.copy()
         # 构造简单的初始占据 (beta)
         occ_beta_guess = np.zeros(self.n_basis)
         occ_beta_guess[:self.n_beta] = 1.0
-        
-        P_alpha = self._build_density_matrix(C_guess, occ_alpha_guess)
-        P_beta = self._build_density_matrix(C_guess, occ_beta_guess)
+        occ_beta=occ_beta_guess.copy()
+        P_alpha = self._build_density_matrix(C_guess, occ_alpha)
+        P_beta = self._build_density_matrix(C_guess, occ_beta)
         
         E_old = 0.0
 
@@ -298,10 +310,9 @@ class AtomicLSDA:
 
             eps_alpha, C_alpha = self._solve_ks_equation(K_alpha, self.S)
             eps_beta, C_beta = self._solve_ks_equation(K_beta, self.S)
-
-            smearing_temp = self.temperature 
-            occ_alpha = self._compute_occupations(eps_alpha, self.n_alpha, temperature=smearing_temp)
-            occ_beta = self._compute_occupations(eps_beta, self.n_beta, temperature=smearing_temp)
+            occ_alpha = self._compute_occupations(eps_alpha, self.n_alpha)
+            occ_beta = self._compute_occupations(eps_beta, self.n_beta)
+           
 
             # === 构建新的密度矩阵 ===
             P_alpha_new = self._build_density_matrix(C_alpha, occ_alpha)
@@ -329,6 +340,29 @@ class AtomicLSDA:
             converged = False
 
         electron_config = self._analyze_electron_configuration(eps_alpha, eps_beta, C_alpha, C_beta)
+
+        rho_alpha_3d, rho_alpha_radial = self._calculate_electron_density_on_grid(P_alpha)
+        rho_beta_3d, rho_beta_radial = self._calculate_electron_density_on_grid(P_beta)
+        v_xc_alpha_grid, v_xc_beta_grid, _ = get_slater_vwn5(rho_alpha_3d, rho_beta_3d)
+        
+        # 2. 计算最终的 Hartree 势网格值
+        rho_radial_total = rho_alpha_radial + rho_beta_radial
+        v_hartree_grid = self._solve_hartree_potential(rho_radial_total)
+        
+        # 3. 计算核势 V_nuc = -Z/r
+        r_safe = np.where(self.r_grid < 1e-12, 1e-12, self.r_grid)
+        v_nuc_grid = -self.integral_calc.nuclear_charge / r_safe
+        
+        # 4. 组装总有效势 V_eff = V_nuc + V_H + V_XC
+        v_eff_alpha = v_nuc_grid + v_hartree_grid + v_xc_alpha_grid
+        v_eff_beta = v_nuc_grid + v_hartree_grid + v_xc_beta_grid
+
+        calc_nelec = simpson(rho_radial_total, x=self.r_grid)
+        logging.info(f"设定电子数: {self.n_electrons}")
+        logging.info(f"积分电子数: {calc_nelec:.4f}")
+        logging.info(f"核电荷数 Z: {self.integral_calc.nuclear_charge}")
+
+
         return KSResults(
             converged=converged, iterations=iteration + 1, total_energy=E_new,
             orbital_energies_alpha=eps_alpha, orbital_energies_beta=eps_beta,
@@ -337,9 +371,83 @@ class AtomicLSDA:
             ks_matrix_alpha=K_alpha, ks_matrix_beta=K_beta,
             electron_configuration=electron_config, integral_calc=self.integral_calc,
             energies=energies,
-            occ_alpha=occ_alpha, occ_beta=occ_beta
+            occ_alpha=occ_alpha, occ_beta=occ_beta,
+            total_potential_alpha=v_eff_alpha,
+            total_potential_beta=v_eff_beta
         )
 
+    # def _solve_hartree_potential(self, rho_radial: np.ndarray) -> np.ndarray:
+    #     """
+    #     求解径向泊松方程计算 Hartree 势 V_H(r)。
+        
+    #     修正版：使用反向积分策略，强制保证 V_H 在边界处的物理正确性，
+    #     消除因 Simpson/Trapezoid 精度不匹配导致的常数平移误差。
+        
+    #     公式: V_H(r) = (1/r) * ∫[0->r] ρ(x) dx  +  ∫[r->∞] (ρ(x)/x) dx
+    #     """
+    #     from scipy.integrate import cumulative_trapezoid
+        
+    #     r = self.r_grid
+    #     # 避免除以 0
+    #     r_safe = np.where(r < 1e-12, 1e-12, r)
+        
+    #     # --- 第一部分：内部电荷贡献 (1/r * Q(r)) ---
+    #     # 使用梯形规则计算累积电荷
+    #     Q_r = cumulative_trapezoid(rho_radial, r, initial=0)
+    #     v_part1 = Q_r / r_safe
+        
+    #     # --- 第二部分：外部壳层贡献 (∫[r->∞] rho/x dx) ---
+    #     # 关键修正：使用反向积分 (从 r_max 到 r)
+    #     # 这样能保证当 r -> r_max 时，积分值自然趋近于 0
+    #     integrand2 = rho_radial / r_safe
+        
+    #     # [::-1] 倒序数组，积分后再倒序回来
+    #     # initial=0 意味着从无穷远(数组末端)开始积分为0
+    #     v_part2 = cumulative_trapezoid(integrand2[::-1], r[::-1], initial=0)[::-1]
+        
+    #     # 总 Hartree 势
+    #     v_h = v_part1 + v_part2
+        
+    #     return v_h
+
+    def _solve_hartree_potential(self, rho_radial: np.ndarray) -> np.ndarray:
+        """
+        求解径向泊松方程计算 Hartree 势 V_H(r)。
+        利用静电学公式 (Atomic units):
+        V_H(r) = (1/r) * ∫[0->r] ρ(x) dx  +  ∫[r->∞] (ρ(x)/x) dx
+        
+        Args:
+            rho_radial: 径向电荷密度 (即 4πr² * ρ_3D)
+            
+        Returns:
+            v_h: 在 r_grid 上的 Hartree 势数组
+        """
+        # 确保引入积分函数
+        from scipy.integrate import cumulative_trapezoid, simpson
+        
+        r = self.r_grid
+        # 避免除以 0 (r=0 处)
+        r_safe = np.where(r < 1e-12, 1e-12, r)
+        
+        # --- 第一部分：内部电荷的贡献 (像点电荷 Q/r) ---
+        # Q(r) = ∫[0->r] rho_radial(x) dx
+        Q_r = cumulative_trapezoid(rho_radial, r, initial=0)
+        v_part1 = Q_r / r_safe
+        
+        # --- 第二部分：外部壳层的贡献 (像球壳势 dQ/r') ---
+        # Integral = ∫[r->∞] (rho_radial(x) / x) dx
+        # 计算方法：先算 0->∞ 的总积分，减去 0->r 的累积积分
+        integrand = rho_radial / r_safe
+        total_integral = simpson(integrand, x=r) # 0 到无穷的总积分
+        cum_integral = cumulative_trapezoid(integrand, r, initial=0) # 0 到 r 的积分
+        
+        v_part2 = total_integral - cum_integral
+        
+        # 总势 V_H(r)
+        v_h = v_part1 + v_part2
+        
+        return v_h
+    
     def _calculate_electron_density_on_grid(self, P: np.ndarray) -> np.ndarray:
         # 计算径向密度 rho_radial(r) = r² × ρ_3D(r)
         # 注意：radial_functions 存储的是 χ(r) = r*R(r)
@@ -410,8 +518,14 @@ class AtomicLSDA:
         energies = {'Kinetic': E_T, 'Nuclear_Attraction': E_Vnuc, 'Hartree': E_J, 'Exchange_Correlation': E_XC, 'Total': E_total}
         return E_total, energies
     
-
-    def _compute_occupations(self, energies: np.ndarray, n_electrons: int, temperature: float = 1e-3) -> np.ndarray:
+    def _compute_occupations(self, energies: np.ndarray, n_electrons: int) -> np.ndarray:
+        if self.occ_method == 'fermi':
+            return self._compute_occupations_fermi(energies, n_electrons, temperature=self.temperature)
+        elif self.occ_method == 'aufbau':
+            return self._compute_occupations_aufbau(energies, n_electrons)
+        else:
+            raise ValueError(f"未知占据方法: {self.occ_method}")
+    def _compute_occupations_fermi(self, energies: np.ndarray, n_electrons: int, temperature: float = 1e-3) -> np.ndarray:
         """
         根据轨道能量和电子数，计算费米-狄拉克分数占据数。
         这能自动处理简并轨道的平均占据 (例如 2个电子分给3个p轨道 -> 各0.66)。
@@ -446,6 +560,12 @@ class AtomicLSDA:
 
         return fermi_dist(mu, energies, temperature)
 
+    def _compute_occupations_aufbau(self, energies: np.ndarray, n_electrons: float, threshold: float =3) -> np.ndarray:
+            # 默认简单整数占据
+            occ = np.zeros_like(energies)
+            occ[:int(n_electrons)] = 1.0
+            return occ
+
     # --- 以下方法与之前版本完全相同 ---
     def _initial_guess(self, S: np.ndarray, H_core: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         _, C_guess = eigh(H_core, S)
@@ -477,7 +597,7 @@ class AtomicLSDA:
 
     def _analyze_electron_configuration(self, eps_alpha: np.ndarray, eps_beta: np.ndarray,
                                         C_alpha: np.ndarray, C_beta: np.ndarray) -> Dict:
-        # (内容与之前版本完全相同)
+  
         orbital_names = self.integral_calc.basis.get_orbital_names()
         occupied_alpha, virtual_alpha, occupied_beta, virtual_beta = [], [], [], []
         for i in range(self.n_basis):

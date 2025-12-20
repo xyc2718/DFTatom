@@ -29,7 +29,7 @@ class AtomicIntegrals:
     - 电子排斥积分（支持完整多极展开）
     """
 
-    def __init__(self, basis_set: BasisSet, nuclear_charge: int=None, pseudo: Pseudopotential=None,max_multipole=-1,real_basis=False):
+    def __init__(self, basis_set: BasisSet, nuclear_charge: int=None, pseudo: Pseudopotential=None,max_multipole=-1,real_basis=False, eri_cache=False):
         """
         初始化积分计算器
         
@@ -54,8 +54,7 @@ class AtomicIntegrals:
         self._setup_integration_grids()
         self._precompute_derivatives()
         self._precompute_gaunt_coefficients()
-        
-    
+        self.eri_cache=eri_cache
         logging.info(f"积分计算器初始化完成 - 基组大小: {self.n_basis}, ERI max multipole: {self.max_multipole}")
     
     def _precompute_orbital_data(self):
@@ -94,61 +93,92 @@ class AtomicIntegrals:
         self.radial_first_derivatives = np.array([
             np.gradient(R, self.dr) for R in self.radial_functions
         ])
-        
-    
     def _precompute_gaunt_coefficients(self):
-        """预计算Gaunt系数"""
-        logging.info("计算Gaunt系数...")
+        """
+        终极优化版：只计算并存储唯一的角动量(l,m)组合的Gaunt系数。
+        内存占用：极小 (MB级别)。
+        """
+        logging.info("计算唯一角动量Gaunt系数表...")
         
-        max_l = np.max(self.orbital_l)
-  
-        max_k = min(self.max_multipole, 2 * max_l) if self.max_multipole>=0 else 2 * max_l
+        # 1. 找出基组中所有出现的 (l, m) 组合，去重
+        # 例如：你的基组可能有 100 个轨道，但可能只有 s, px, py, pz, dxy... 这 9 种角动量类型
+        # 我们不仅要提取 l, 还要提取 m
+        unique_lms = set()
+        for l, m in zip(self.orbital_l, self.orbital_m):
+            unique_lms.add((l, m))
         
-        self.gaunt_cache = {}
-        self.zero_gaunt_integrals = set()  # 记录所有Gaunt系数都为零的积分
+        unique_lms = sorted(list(unique_lms)) # 排序保证顺序一致
+        n_unique = len(unique_lms)
         
-        total_combinations = 0
-        computed_combinations = 0
+        # 2. 存储结构：Key 是 ((l1,m1), (l2,m2), (l3,m3), (l4,m4))
+        self.angular_gaunt_cache = {} 
         
-        for mu in range(self.n_basis):
-            for nu in range(self.n_basis):
-                for lam in range(self.n_basis):
-                    for sig in range(self.n_basis):
-                        total_combinations += 1
-                        l1, m1 = self.orbital_l[mu], self.orbital_m[mu]
-                        l2, m2 = self.orbital_l[nu], self.orbital_m[nu]
-                        l3, m3 = self.orbital_l[lam], self.orbital_m[lam]
-                        l4, m4 = self.orbital_l[sig], self.orbital_m[sig]
+        max_k = self.max_multipole if self.max_multipole >= 0 else 2 * np.max(self.orbital_l)
+        
+        count = 0
+        # 3. 只循环唯一的角动量组合 (对于 lmax=2，这里只有 9^4 = 6561 次循环)
+        for lm1 in unique_lms:
+            for lm2 in unique_lms:
+                for lm3 in unique_lms:
+                    for lm4 in unique_lms:
                         
-                        has_nonzero_gaunt = False
+                        l1, m1 = lm1
+                        l2, m2 = lm2
+                        l3, m3 = lm3
+                        l4, m4 = lm4
                         
-                        # 计算这个轨道组合的所有有效k值的Gaunt系数
+                        # --- 快速剪枝 (Selection Rules) ---
+                        # 必须满足宇称守恒，不然积分必为0
+                        # 这里的 k 是针对每一对 (1,2) 和 (3,4) 耦合的
+                        # 我们只需要判断是否有任何 k 可能非零
+                        # 简单的宇称判断：l1+l2 和 l3+l4 的奇偶性必须一致，否则无法通过 k 耦合？
+                        # 更严格的在下面 k 循环里判断
+                        
+                        coeffs = {} # 存储该角度组合下所有非零的 (k, mk): value
+                        has_nonzero = False
+                        
                         for k in range(max_k + 1):
+                            # 再次应用三角不等式和宇称
+                            if not (abs(l1 - l2) <= k <= l1 + l2): continue
+                            if (l1 + l2 + k) % 2 != 0: continue
+                            if not (abs(l3 - l4) <= k <= l3 + l4): continue
+                            if (l3 + l4 + k) % 2 != 0: continue
+                            
                             for mk in range(-k, k + 1):
+                                # 计算函数 (假设你已经定义好了)
                                 if self.real_basis:
-                                    gaunt_coeff = self._compute_gaunt_coefficient_product_real(
-                                    l1, m1, l2, m2, l3, m3, l4, m4, k, mk
-                                )
+                                    val = self._compute_gaunt_coefficient_product_real(
+                                        l1, m1, l2, m2, l3, m3, l4, m4, k, mk
+                                    )
                                 else:
-                                    gaunt_coeff = self._compute_gaunt_coefficient_product(
-                                    l1, m1, l2, m2, l3, m3, l4, m4, k, mk
-                                )
-                                if abs(gaunt_coeff) > 1e-12:
-                                    key = (mu, nu, lam, sig, k, mk)
-                                    self.gaunt_cache[key] = gaunt_coeff
-                                    has_nonzero_gaunt = True
+                                    val = self._compute_gaunt_coefficient_product(
+                                        l1, m1, l2, m2, l3, m3, l4, m4, k, mk
+                                    )
+                                    
+                                if abs(val) > 1e-12:
+                                    coeffs[(k, mk)] = val
+                                    has_nonzero = True
                         
-                        if has_nonzero_gaunt:
-                            computed_combinations += 1
-                        else:
-                            # 记录这个组合没有非零Gaunt系数
-                            self.zero_gaunt_integrals.add((mu, nu, lam, sig))
+                        if has_nonzero:
+                            # 存入缓存
+                            # Key: 4个 tuple
+                            self.angular_gaunt_cache[(lm1, lm2, lm3, lm4)] = coeffs
+                            count += 1
+
+        logging.info(f"Gaunt系数表构建完成。唯一非零角度组合数: {count}/{n_unique**4}")
+
+    def lookup_gaunt_coeffs(self, mu, nu, lam, sig):
+        """
+        在计算积分的主循环中调用此函数
+        """
+        #  从基组信息中获取这四个轨道的 l, m
+        lm1 = (self.orbital_l[mu], self.orbital_m[mu])
+        lm2 = (self.orbital_l[nu], self.orbital_m[nu])
+        lm3 = (self.orbital_l[lam], self.orbital_m[lam])
+        lm4 = (self.orbital_l[sig], self.orbital_m[sig])
         
-        logging.debug(f"Gaunt系数预计算完成：")
-        logging.debug(f"  总轨道组合: {total_combinations}")
-        logging.debug(f"  有效组合: {computed_combinations}")
-        logging.debug(f"  缓存系数数量: {len(self.gaunt_cache)}")
-        logging.debug(f"  零积分组合: {len(self.zero_gaunt_integrals)}")
+        # 如果表中没有这个 key，说明全是 0
+        return self.angular_gaunt_cache.get((lm1, lm2, lm3, lm4), {})
     
     def _compute_gaunt_coefficient_product(self, l1, m1, l2, m2, l3, m3, l4, m4, k, mk):
         """
@@ -427,52 +457,6 @@ class AtomicIntegrals:
         return V * self.angular_selection_matrix
 
     
-    # def _compute_nuclear_attraction_matrix_pseudo_nonlocal(self) -> np.ndarray:
-    #     """
-    #     计算赝势非局域部分的核吸引积分矩阵
-        
-    #     V_μν^NL = Σ_ij ⟨φ_μ|β_i⟩ D_ij ⟨β_j|φ_ν⟩
-        
-    #     Returns:
-    #         np.ndarray: 非局域核吸引矩阵 [n_basis, n_basis]
-    #     """
-    #     logging.info("计算赝势非局域核吸引积分矩阵...")
-        
-        
-    #     n_basis = self.n_basis
-    #     n_projectors = len(self.pseudo.beta_projectors)
-        
-    #     # S_proj (n_basis x n_projectors) 矩阵，S_{μi} = ⟨φ_μ|β_i⟩
-        
-    #     S_proj = np.zeros((n_basis, n_projectors))
-        
-    #     # 遍历所有基函数 μ
-    #     for mu in range(n_basis):
-    #         orb_l = self.orbital_l[mu]
-    #         orb_m = self.orbital_m[mu]
-            
-    #         # 遍历所有投影函数 i
-    #         for i in range(n_projectors):
-    #             proj = self.pseudo.beta_projectors[i]
-    #             if orb_l == proj.l :
-    #                 # 径向积分: ∫ rR_μ(r) * rβ_i(r) dr
-    #                 integrand = self.radial_functions[mu] * proj.radial_function(self.r_grid)
-    #                 # 将计算结果存入 S_proj 矩阵
-    #                 S_proj[mu, i] = simpson(integrand, x=self.r_grid)
-
-
-    #     D_matrix = self.pseudo.d_matrix
-    #     print(D_matrix.shape)
-    #     print(S_proj.shape)
-    
-    #     #通过矩阵乘法构建完整的非局域矩阵 V_non_local ---
-    #     # V_NL = S_proj * D * S_proj^T
-    #     # (n_basis, n_proj) @ (n_proj, n_proj) -> (n_basis, n_proj)
-    #     # (n_basis, n_proj) @ (n_proj, n_basis) -> (n_basis, n_basis)
-    #     V_non_local_matrix = S_proj @ D_matrix @ S_proj.T
-        
-    #     return V_non_local_matrix
-
     def _compute_nuclear_attraction_matrix_pseudo_nonlocal(self) -> np.ndarray:
         """
         计算修正后的赝势非局域部分积分矩阵
@@ -531,10 +515,8 @@ class AtomicIntegrals:
             for mk in range(-k, k + 1):
                 # 获取Gaunt系数
                 gaunt_key = (mu, nu, lam, sig, k, mk)
-                if gaunt_key not in self.gaunt_cache:
-                    continue
-                
-                gaunt_coeff = self.gaunt_cache[gaunt_key]
+              
+                gaunt_coeff = self.lookup_gaunt_coeffs(mu, nu, lam, sig).get((k, mk), 0.0)
                 if abs(gaunt_coeff) < 1e-12:
                     continue
  
@@ -562,8 +544,6 @@ class AtomicIntegrals:
                 for lam in range(self.n_basis):
                     for sig in range(self.n_basis):
                         total_integrals += 1
-                        if (mu, nu, lam, sig) in self.zero_gaunt_integrals:
-                            continue
                         integral_value = self._compute_eri_element_k(mu, nu, lam, sig, max_k)
                         eri[mu, nu, lam, sig] = integral_value
                         
@@ -601,6 +581,36 @@ class AtomicIntegrals:
         计算k阶多极展开的径向积分
         Rₖ=∫dr₁ ∫dr₂ ρ₁(r₁) [r_<ᵏ / r_>ᵏ⁺¹] ρ₂(r₂)=(1/r₁ᵏ⁺¹) ∫_0^r₁ r₂ᵏ ρ₂(r₂) dr₂ + r₁ᵏ ∫_r₁^∞ [ρ₂(r₂)/r₂ᵏ⁺¹] dr₂
         """
+        if self.eri_cache:
+            # 如果实例中还没有缓存字典，则创建一个
+            if not hasattr(self, '_radial_cache'):
+                self._radial_cache = {}
+
+            # 提取量子数 (n, l)
+            nl_mu = (self.orbital_n[mu], self.orbital_l[mu])
+            nl_nu = (self.orbital_n[nu], self.orbital_l[nu])
+            nl_lam = (self.orbital_n[lam], self.orbital_l[lam])
+            nl_sig = (self.orbital_n[sig], self.orbital_l[sig])
+
+            # 构建 Key：利用对称性排序，确保 2p_x, 2p_y 等不同轨道能命中同一个 Key
+            # 1. 确保 pair 内部有序： (mu, nu) -> sorted -> pair1
+            pair1 = tuple(sorted((nl_mu, nl_nu)))
+            pair2 = tuple(sorted((nl_lam, nl_sig)))
+            
+            # 2. 确保 pair 之间有序： (pair1, pair2) -> sorted -> key_basis
+            #    这样 (A, B | C, D) 和 (C, D | A, B) 将命中同一个缓存
+            key_basis = tuple(sorted((pair1, pair2)))
+            
+            # 3. 最终 Key 包含 k
+            cache_key = (key_basis, k)
+
+            # -----------------------------------------------------------
+            # 2. 查表：如果命中直接返回
+            # -----------------------------------------------------------
+            if cache_key in self._radial_cache:
+                return self._radial_cache[cache_key]
+        
+        
         # 1. 获取径向密度函数 rho(r) = R(r1)R(r2)r^2
         # rho1对应(mu, nu)，rho2对应(lam, sig)
         rho1 = self.radial_functions[mu] * self.radial_functions[nu] 

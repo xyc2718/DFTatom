@@ -18,7 +18,7 @@ class PseudopotentialGenerator:
     从全电子 LSDA 计算结果生成模守恒赝势 (Norm-Conserving Pseudopotential)
     """
 
-    def __init__(self, ks_results: KSResults, r_cuts: Dict[str, float] = None):
+    def __init__(self, ks_results: KSResults, r_cuts: Dict[str, float] = None,spin='alpha',v_shift: float=0.0,auto_v_shift=True):
         """
         Args:
             ks_results: 全电子 LSDA 计算结果对象
@@ -28,16 +28,13 @@ class PseudopotentialGenerator:
         self.atom_element = ks_results.integral_calc.basis.element
         self.Z = ks_results.integral_calc.nuclear_charge
         self.r_grid = ks_results.integral_calc.r_grid
-        
+        self.spin=spin
+        self.v_shift = v_shift
         # 确保 r_grid 不含 0 点以避免除零
         self.r_safe = np.where(self.r_grid < 1e-12, 1e-12, self.r_grid)
         
-        # --- 修复点 1: 强制 self.dr 为标量 ---
         # 假设是均匀网格，直接取前两点的差
         self.dr = self.r_grid[1] - self.r_grid[0]
-        # 如果 integral_calc 中存了 dr，也可以直接用
-        if hasattr(ks_results.integral_calc, 'dr'):
-            self.dr = ks_results.integral_calc.dr
         
         # 默认截断半径
         default_rc = 1.5
@@ -47,11 +44,24 @@ class PseudopotentialGenerator:
 
         self.l_max = 0
         self.valence_config = {} 
+        self.v_ae_alpha = ks_results.total_potential_alpha
+        self.v_ae_beta = ks_results.total_potential_beta
+        self.auto_v_shift = auto_v_shift
+        if self.auto_v_shift:
+            if self.spin=='alpha':
+                self.v_shift=self.v_ae_alpha[-1]
+            else:
+                self.v_shift=self.v_ae_beta[-1]
 
     def generate(self, local_channel: str = 'p') -> Pseudopotential:
         """生成赝势的主流程"""
         logging.info(f"开始为元素 {self.atom_element} 生成赝势...")
-        
+        # 根据请求的自旋选择对应的全电子势
+        if self.spin == 'alpha':
+            self.v_ae_total = self.v_ae_alpha.copy()
+        else:
+            self.v_ae_total = self.v_ae_beta.copy()
+        self.v_ae_total -= self.v_shift
         # 1. 提取全电子价态波函数
         self._extract_ae_valence_states()
         
@@ -159,6 +169,7 @@ class PseudopotentialGenerator:
         d_matrix = np.diag(d_matrix_blocks) if n_proj > 0 else np.zeros((0,0))
 
         v_local_interp = interp1d(self.r_grid, v_local_grid, kind='cubic', bounds_error=False, fill_value=(v_local_grid[0], 0.0))
+        self.pseudo_data = pseudo_data
 
         # 6. 封装
         pseudo = Pseudopotential(
@@ -177,47 +188,102 @@ class PseudopotentialGenerator:
         
         logging.info("赝势生成完成！")
         return pseudo
-
     def _extract_ae_valence_states(self):
+        """
+        修正版：正确处理简并轨道的占据数累加。
+        逻辑：
+        1. 遍历所有轨道，根据 (l, energy) 进行分组。
+        2. 在组内累加占据数 (解决 0.33+0.33+0.33=1.0 的问题)。
+        3. 对于每个 l，只保留能量最高的那个组（价态）。
+        """
         res = self.results
         n_arr = res.integral_calc.orbital_n
         l_arr = res.integral_calc.orbital_l
         basis_funcs = res.integral_calc.radial_functions 
         
-        C = res.coefficients_alpha 
-        occ = res.occ_alpha + res.occ_beta 
-        eps = res.orbital_energies_alpha
+        # 1. 准备数据
+        if self.spin == 'alpha':
+            C = res.coefficients_alpha 
+            occ = res.occ_alpha 
+            # 注意：这里立刻应用 v_shift，后续所有逻辑都基于修正后的能量
+            eps = res.orbital_energies_alpha - self.v_shift 
+        else:
+            C = res.coefficients_beta 
+            occ = res.occ_beta 
+            eps = res.orbital_energies_beta - self.v_shift
 
-        found_states = {} 
+        # 2. 【核心步骤】分组与累加
+        # 字典结构: groups[(l, energy_rounded)] = { ... state_data ... }
+        groups = {}
         
         for i in range(res.integral_calc.n_basis):
+            # 忽略完全空的轨道 (甚至忽略 < 0.01 的，因为我们要找主价态)
+            # 但对于 0.33 这种占据，必须保留
             if occ[i] < 1e-3: continue 
-            
+
+            # 确定当前轨道的 l 和 n (基于最大贡献的基函数)
             weights = C[:, i]**2
             main_idx = np.argmax(weights)
             l_curr = l_arr[main_idx]
-            n_curr = n_arr[main_idx] 
+            n_curr = n_arr[main_idx]
             
-            if l_curr not in found_states or eps[i] > found_states[l_curr]['energy']:
-                u_recon = np.zeros_like(self.r_grid)
-                relevant_indices = [k for k in range(len(l_arr)) if l_arr[k] == l_curr]
-                
-                for k in relevant_indices:
-                    u_recon += C[k, i] * basis_funcs[k]
-                
-                norm = simpson(u_recon**2, self.r_grid)
-                u_recon /= np.sqrt(norm)
-                
-                found_states[l_curr] = {
+            # 能量四舍五入，用于识别简并轨道
+            # 例如 -0.033037 和 -0.033038 会被视为同一个 key
+            e_curr = eps[i]
+            e_key = round(e_curr, 4) 
+            group_key = (l_curr, e_key)
+            
+            # 重构波函数 (只需要做一次，但为了简单先在这里做)
+            # 实际上对于简并轨道，径向部分是一样的，存哪一个都行
+            u_recon = np.zeros_like(self.r_grid)
+            relevant_indices = [k for k in range(len(l_arr)) if l_arr[k] == l_curr]
+            for k in relevant_indices:
+                u_recon += C[k, i] * basis_funcs[k]
+            norm = simpson(u_recon**2, self.r_grid)
+            u_recon /= np.sqrt(norm)
+
+            if group_key not in groups:
+                # 新发现的能级组
+                groups[group_key] = {
                     'n': n_curr,
-                    'energy': eps[i],
-                    'occupation': occ[i],
+                    'l': l_curr,
+                    'energy': e_curr,       # 存精确能量
+                    'occupation': occ[i],   # 初始化占据数
                     'radial_func': u_recon
                 }
-        
-        self.valence_config = found_states
-        logging.info(f"提取到的价态: { {k: f'n={v['n']}, e={v['energy']:.3f}' for k,v in found_states.items()} }")
+            else:
+                # 已存在的能级组 -> 累加占据数！
+                # 这就是解决问题的关键：0.33 -> 0.66 -> 0.99
+                groups[group_key]['occupation'] += occ[i]
+                
+                # 可选：如果新轨道的能量略高（微小差异），更新为更精确的能量
+                # 或者保持平均，这里为了简单保留第一个遇到的即可
 
+        # 3. 【筛选步骤】挑选价态
+        # 现在 groups 里可能有：
+        # (l=0, e=-55): occ=2.0 (1s)
+        # (l=0, e=-3.9): occ=2.0 (2s)
+        # (l=0, e=-0.2): occ=2.0 (3s)
+        # (l=1, e=-2.4): occ=6.0 (2p)
+        # (l=1, e=-0.03): occ=1.0 (3p)  <-- 我们要这个！
+        
+        final_valence = {}
+        
+        for key, data in groups.items():
+            l = data['l']
+            e = data['energy']
+            
+            # 如果是同 l 的新能级，检查是否能量更高
+            if l not in final_valence or e > final_valence[l]['energy']:
+                final_valence[l] = data
+
+        self.valence_config = final_valence
+        
+        # 4. 打印结果供检查
+        log_msg = "提取到的价态(修正后): "
+        for l, v in self.valence_config.items():
+            log_msg += f"[L={l} n={v['n']} e={v['energy']:.4f} occ={v['occupation']:.2f}] "
+        logging.info(log_msg)
     def _pseudize_channel(self, l: int, u_ae_in: np.ndarray, energy: float, rc: float) -> Tuple[np.ndarray, np.ndarray]:
         u_ae = u_ae_in.copy()
         idx_rc = np.searchsorted(self.r_grid, rc)
@@ -294,14 +360,7 @@ class PseudopotentialGenerator:
         
         term = Ppp + Pp**2 + 2*(l+1)*Pp/r_in
         v_scr[:idx_rc+1] = energy + 0.5 * term
-        
-        # B. 外部区域
-        u_out = u_pp
-        d2u_out = np.gradient(np.gradient(u_out, self.dr), self.dr)
-        denom = np.where(abs(u_out) > 1e-12, u_out, 1e-12)
-        v_scr_out = energy + 0.5 * d2u_out / denom - 0.5 * l*(l+1) / (self.r_safe**2)
-        
-        v_scr[idx_rc+1:] = v_scr_out[idx_rc+1:]
+        v_scr[idx_rc+1:] = self.v_ae_total[idx_rc+1:]
         
         return u_pp, v_scr
 
