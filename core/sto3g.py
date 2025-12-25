@@ -86,6 +86,95 @@ def generate_gaussian_basis_set(
         
     return basis_set
 
+import numpy as np
+from scipy.special import gamma
+from typing import List, Dict
+
+def generate_gaussian_basis_set_log(
+    element: str,
+    primitives: List[Dict],
+    radius_cutoff: float = 7.0,
+    mesh_size: int = 701,
+    r_min: float = 1e-5
+) -> BasisSet:
+    """
+    根据给定的高斯基元参数，生成一个基于**对数网格**的数值化 BasisSet 对象。
+
+    Args:
+        element: 元素符号 (e.g., 'C').
+        primitives: 一个字典列表，每个字典描述一个高斯基元。
+                    例如: [{'l': 0, 'm': 0, 'alpha': 0.5}, {'l': 1, 'm': 0, 'alpha': 0.3}]
+        radius_cutoff: 径向网格的最大半径 (Bohr).
+        mesh_size: 径向网格的点数.
+        r_min: 对数网格的最小半径 (Bohr). 对数网格不能从0开始. 默认为 1e-5.
+
+    Returns:
+        一个填充了数值原子轨道的 BasisSet 对象 (使用对数网格).
+    """
+    if not all(k in p for k in ['l', 'm', 'alpha'] for p in primitives):
+        raise ValueError("每个基元字典必须包含 'l', 'm', 'alpha' 三个键。")
+
+    # 1. 创建对数径向网格和 BasisSet 对象
+    # 使用 geometric space (等比数列)，对应于对数空间上的均匀分布
+    # r[i] = r_min * exp(i * dx)
+    r_grid = np.geomspace(r_min, radius_cutoff, mesh_size)
+    
+    # 计算对数步长 dx (如果下游代码需要)
+    # r_max = r_min * exp((N-1) * dx)  =>  dx = ln(r_max/r_min) / (N-1)
+    dx = np.log(radius_cutoff / r_min) / (mesh_size - 1)
+
+    basis_set = BasisSet(element)
+    basis_set.set_basis_parameters(radius_cutoff=radius_cutoff)
+    
+    # 注意: 对数网格没有单一的 dr，这里存储对数步长 dx 或许更有用，
+    # 或者如果不兼容旧接口，可以设为 None
+    if hasattr(basis_set, 'dx'): 
+        basis_set.dx = dx
+    # 依然可以近似存一个 dr 用于某些不敏感的打印，但严谨计算不应使用它
+    basis_set.dr = None 
+    
+    # 用于为轨道命名和索引的计数器
+    l_counts = {}
+
+    # 2. 遍历所有高斯基元
+    for prim in primitives:
+        l = prim['l']
+        m = prim['m']
+        alpha = prim['alpha']
+
+        # 3. 计算归一化系数 N
+        # 归一化是基于全空间积分的解析解，与网格形式无关，公式不变。
+        # integral( |N * r^l * exp(-alpha*r^2)|^2 * r^2 dr ) = 1
+        n_integral = 2 * l + 2
+        a_integral = 2 * alpha
+        
+        integral_val = gamma((n_integral + 1) / 2) / (2 * a_integral**((n_integral + 1) / 2))
+        N = 1.0 / np.sqrt(integral_val)
+
+        # 4. 在对数网格上生成数值径向函数 r*R
+        # u(r) = r * R(r) = N * r^(l+1) * exp(-alpha * r^2)
+        # 直接代入新的 r_grid 进行计算
+        radial_function = N * (r_grid**(l+1)) * np.exp(-alpha * r_grid**2)
+        
+        # 5. 创建并添加 AtomicOrbital 对象
+        if l not in l_counts:
+            l_counts[l] = 0
+        l_counts[l] += 1
+        n_index = l_counts[l]
+        
+        atomic_orbital = AtomicOrbital(
+            n=n_index, 
+            l=l,
+            m=m,
+            orbital_type=l,
+            n_index=n_index-1,
+            r_grid=r_grid.copy(),  # 传入对数网格
+            radial_function=radial_function.copy()
+        )
+        basis_set.add_orbital(atomic_orbital)
+        
+    return basis_set
+
 
 
 def get_basis_params_from_file(atomic_symbol: str,basis_file_path=STO3GPATH) -> list[dict]:
@@ -165,7 +254,7 @@ def get_basis_params_from_file(atomic_symbol: str,basis_file_path=STO3GPATH) -> 
     return basis_functions[::-1]
 
 def get_sto3g_basis(atomic_symbol: str, radius_cutoff: float = 7.0,
-    mesh_size: int = 701 ) -> BasisSet:
+    mesh_size: int = 701,grid_type='linear') -> BasisSet:
     """
     获取指定原子的 STO-3G 基组，并生成对应的 BasisSet 对象。
 
@@ -177,11 +266,14 @@ def get_sto3g_basis(atomic_symbol: str, radius_cutoff: float = 7.0,
         一个填充了数值原子轨道的 BasisSet 对象。
     """
     primitives = get_basis_params_from_file(atomic_symbol)
-    basis_set = generate_gaussian_basis_set(atomic_symbol, primitives, radius_cutoff, mesh_size)
+    if grid_type=='linear':
+        basis_set = generate_gaussian_basis_set(atomic_symbol, primitives, radius_cutoff, mesh_size)
+    elif grid_type=='log':
+        basis_set = generate_gaussian_basis_set_log(atomic_symbol, primitives, radius_cutoff, mesh_size)
     return basis_set
 
 def get_sto6g_basis(atomic_symbol: str, radius_cutoff: float = 10.0,
-    mesh_size: int = 701 ) -> BasisSet:
+    mesh_size: int = 701,grid_type='linear') -> BasisSet:
     """
     获取指定原子的 STO-3G 基组，并生成对应的 BasisSet 对象。
 
@@ -193,10 +285,13 @@ def get_sto6g_basis(atomic_symbol: str, radius_cutoff: float = 10.0,
         一个填充了数值原子轨道的 BasisSet 对象。
     """
     primitives = get_basis_params_from_file(atomic_symbol,basis_file_path=STO6GPATH)
-    basis_set = generate_gaussian_basis_set(atomic_symbol, primitives, radius_cutoff, mesh_size)
+    if grid_type=='linear':
+        basis_set = generate_gaussian_basis_set(atomic_symbol, primitives, radius_cutoff, mesh_size)
+    elif grid_type=='log':
+        basis_set = generate_gaussian_basis_set_log(atomic_symbol, primitives, radius_cutoff, mesh_size)
     return basis_set
 def get_aug_cc_pvtz_basis(atomic_symbol: str, radius_cutoff: float = 10.0,
-    mesh_size: int = 701 ) -> BasisSet:
+    mesh_size: int = 701,grid_type='linear') -> BasisSet:
     """
     获取指定原子的 STO-3G 基组，并生成对应的 BasisSet 对象。
 
@@ -208,11 +303,14 @@ def get_aug_cc_pvtz_basis(atomic_symbol: str, radius_cutoff: float = 10.0,
         一个填充了数值原子轨道的 BasisSet 对象。
     """
     primitives = get_basis_params_from_file(atomic_symbol,basis_file_path=AUGCCPVTZPATH)
-    basis_set = generate_gaussian_basis_set(atomic_symbol, primitives, radius_cutoff, mesh_size)
+    if grid_type=='linear':
+        basis_set = generate_gaussian_basis_set(atomic_symbol, primitives, radius_cutoff, mesh_size)
+    elif grid_type=='log':
+        basis_set = generate_gaussian_basis_set_log(atomic_symbol, primitives, radius_cutoff, mesh_size)
     return basis_set
 
 def get_ano_rcc_vqzp_basis(atomic_symbol: str, radius_cutoff: float = 10.0,
-    mesh_size: int = 701 ) -> BasisSet:
+    mesh_size: int = 701,grid_type='linear') -> BasisSet:
     """
     获取指定原子的 STO-3G 基组，并生成对应的 BasisSet 对象。
 
@@ -225,7 +323,10 @@ def get_ano_rcc_vqzp_basis(atomic_symbol: str, radius_cutoff: float = 10.0,
         一个填充了数值原子轨道的 BasisSet 对象。
     """
     primitives = get_basis_params_from_file(atomic_symbol,basis_file_path=ANORCCVQZPPATH)
-    basis_set = generate_gaussian_basis_set(atomic_symbol, primitives, radius_cutoff, mesh_size)
+    if grid_type=='linear':
+        basis_set = generate_gaussian_basis_set(atomic_symbol, primitives, radius_cutoff, mesh_size)
+    elif grid_type=='log':
+        basis_set = generate_gaussian_basis_set_log(atomic_symbol, primitives, radius_cutoff, mesh_size)
     return basis_set
 
 # --- 使用示例 ---

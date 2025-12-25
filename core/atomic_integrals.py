@@ -47,7 +47,7 @@ class AtomicIntegrals:
         if nuclear_charge is not None:
             self.nuclear_charge = nuclear_charge
         else:
-            self.nuclear_charge = int(pseudo.z_valence)
+            self.nuclear_charge = int(np.round(pseudo.z_valence))
         self.pseudo = pseudo
         # 预计算所有需要的数据以加速后续计算
         self._precompute_orbital_data()
@@ -90,15 +90,17 @@ class AtomicIntegrals:
 
     def _precompute_derivatives(self):
         """预计算径向函数的导数"""
+        # self.radial_first_derivatives = np.array([
+        #     np.gradient(R, self.dr) for R in self.radial_functions
+        # ])
         self.radial_first_derivatives = np.array([
-            np.gradient(R, self.dr) for R in self.radial_functions
+            np.gradient(R, self.r_grid) for R in self.radial_functions
         ])
     def _precompute_gaunt_coefficients(self):
         """
-        终极优化版：只计算并存储唯一的角动量(l,m)组合的Gaunt系数。
-        内存占用：极小 (MB级别)。
+        计算并储存角动量(l,m)组合的Gaunt系数。
         """
-        logging.info("计算唯一角动量Gaunt系数表...")
+        logging.info("计算角动量Gaunt系数表...")
         
         # 1. 找出基组中所有出现的 (l, m) 组合，去重
         # 例如：你的基组可能有 100 个轨道，但可能只有 s, px, py, pz, dxy... 这 9 种角动量类型
@@ -749,6 +751,91 @@ class AtomicIntegrals:
         V = self.compute_nuclear_attraction_matrix()
         return T + V
     
+    def compute_dipole_matrix(self) -> np.ndarray:
+        """
+        计算偶极矩积分矩阵
+        
+        D_μν = ⟨φ_μ|r|φ_ν⟩
+        返回形状为 (3, n_basis, n_basis) 的张量，分别对应 x, y, z 分量
+        """
+        logging.info("计算偶极矩积分矩阵 (Dipole Matrix)...")
+        
+        # 1. 计算径向积分部分
+        # Radial Integral = ∫ R_μ(r) R_ν(r) r * r^2 dr (如果 R 是原始径向函数)
+        # 或者 ∫ u_μ(r) u_ν(r) r dr (如果 radial_functions 是 u(r)=rR(r))
+        # 基于你现有代码 Overlap=∫R*R 和 Nuclear=∫R*R/r 的逻辑，
+        # 这里应该是 ∫ radial_func * radial_func * r
+        
+        integrand_matrix = (
+            self.radial_functions[:, np.newaxis, :] * self.radial_functions[np.newaxis, :, :] * self.r_grid[np.newaxis, np.newaxis, :]
+        )
+        
+        # 径向积分矩阵 [n_basis, n_basis]
+        D_radial = np.array([
+            [simpson(integrand_matrix[mu, nu], x=self.r_grid) 
+             for nu in range(self.n_basis)]
+            for mu in range(self.n_basis)
+        ])
+        
+        # 2. 初始化结果张量 (3, n, n) -> (x, y, z)
+        D_matrix = np.zeros((3, self.n_basis, self.n_basis))
+        
+        # 几何因子 sqrt(4π/3)
+        geometric_factor = np.sqrt(4.0 * np.pi / 3.0)
+        
+        # 3. 定义偶极算符对应的 (l, m)
+        # 注意：这里假设了实球谐函数的顺序习惯。
+        # 通常: z -> (1,0), x -> (1,1), y -> (1,-1)
+        # 如果是复球谐函数: z -> (1,0), x,y 需要由 (1,1) 和 (1,-1) 线性组合
+        
+        dipole_components = [
+            (1, 1),   # x (对应的实球谐函数 S_{1,1})
+            (1, -1),  # y (对应的实球谐函数 S_{1,-1})
+            (1, 0)    # z (对应的实球谐函数 S_{1,0})
+        ]
+        
+        # 4. 计算矩阵元素
+        for mu in range(self.n_basis):
+            l1, m1 = self.orbital_l[mu], self.orbital_m[mu]
+            
+            for nu in range(self.n_basis):
+                l2, m2 = self.orbital_l[nu], self.orbital_m[nu]
+                
+                # 选择定则优化：偶极跃迁要求 Δl = ±1
+                if abs(l1 - l2) != 1:
+                    continue
+                
+                # 径向部分
+                rad_val = D_radial[mu, nu]
+                
+                # 对 x, y, z 三个分量循环
+                for comp_idx, (l_op, m_op) in enumerate(dipole_components):
+                    # 计算角度积分 <l1 m1 | Y_{1, m_op} | l2 m2>
+                    # 注意：你的 _compute_single_gaunt 逻辑是 Integral(Y1 Y2 Y3)
+                    # 所以这里是 Integral(Y_mu * Y_op * Y_nu)
+                    
+                    if self.real_basis:
+                        ang_val = self._compute_single_gaunt_coefficient_real(
+                            l1, m1, l_op, m_op, l2, m2
+                        )
+                    else:
+                        # 复数基组情况下的处理 (需要特别注意 x,y 的定义)
+                        # 如果是复数基组，直接算 component 会得到球张量分量 (+1, -1, 0)
+                        # 需要转换到笛卡尔坐标。这里简化处理，假设用户主要用 real_basis
+                        # 如果必须支持复数，x = 1/sqrt(2) * (Y_1,-1 - Y_1,1) 等
+                        if m_op == 0: # z
+                             ang_val = self._compute_single_gaunt_coefficient(l1, -m1, l_op, m_op, l2, m2) * ((-1)**m1)
+                        else:
+                            # 暂时对复数基组仅支持 Z 方向或抛出警告，
+                            # 或者你需要在这里手动实现复数 Ylm 到 Cartesian 的转换
+                            # 考虑到 TDDFT 通常在实空间/实轨道下做，这里主要保证 real_basis 正确
+                             ang_val = 0.0 
+
+                    if abs(ang_val) > 1e-12:
+                        D_matrix[comp_idx, mu, nu] = geometric_factor * rad_val * ang_val
+
+        return D_matrix
+
     def compute_all_integrals(self) -> Dict[str, np.ndarray]:
         """
         计算所有需要的积分

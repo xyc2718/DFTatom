@@ -431,7 +431,8 @@ class AtomicLSDA:
         
         # --- 第一部分：内部电荷的贡献 (像点电荷 Q/r) ---
         # Q(r) = ∫[0->r] rho_radial(x) dx
-        Q_r = cumulative_trapezoid(rho_radial, r, initial=0)
+        # Q_r = cumulative_trapezoid(rho_radial, r, initial=0)
+        Q_r=simpson(rho_radial, x=r, initial=0)
         v_part1 = Q_r / r_safe
         
         # --- 第二部分：外部壳层的贡献 (像球壳势 dQ/r') ---
@@ -439,7 +440,8 @@ class AtomicLSDA:
         # 计算方法：先算 0->∞ 的总积分，减去 0->r 的累积积分
         integrand = rho_radial / r_safe
         total_integral = simpson(integrand, x=r) # 0 到无穷的总积分
-        cum_integral = cumulative_trapezoid(integrand, r, initial=0) # 0 到 r 的积分
+        # cum_integral = cumulative_trapezoid(integrand, r, initial=0) # 0 到 r 的积分
+        cum_integral=simpson(integrand, x=r, initial=0)
         
         v_part2 = total_integral - cum_integral
         
@@ -566,7 +568,6 @@ class AtomicLSDA:
             occ[:int(n_electrons)] = 1.0
             return occ
 
-    # --- 以下方法与之前版本完全相同 ---
     def _initial_guess(self, S: np.ndarray, H_core: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         _, C_guess = eigh(H_core, S)
         return self._build_density_matrix(C_guess, self.n_alpha), self._build_density_matrix(C_guess, self.n_beta)
