@@ -18,24 +18,18 @@
 
 ```
 DFTatom/
-├── core/                          # 核心模块
-│   ├── atomic_integrals.py        # 积分计算
-│   ├── basis_set.py               # 基组类
-│   ├── pseudo.py                  # 赝势类
+├── core/                          # 核心计算模块
+│   ├── __init__.py                # 包初始化文件
+│   ├── atomic_integrals.py        # 单/双电子积分计算（重叠、动能、库仑）
+│   ├── basis_set.py               # 基组基类
+│   ├── pseudo.py                  # 赝势基类（模守恒赝势接口）
+│   ├── pseudo_gen.py              # 赝势生成工具
 │   ├── sto3g.py                   # STO-3G基组
 │   ├── HF.py                      # Hartree-Fock
 │   ├── LSDA.py                    # LSDA
-│   └── visualization.py           # 可视化工具
-├── main/                          # 主要脚本
-│   ├── generate_all_results.py   # 生成所有计算数据
-│   └── plot_wavefunctions.py     # 生成波函数图片
-├── readme/                        # LaTeX文档
-│   ├── readme.tex                 # 主文档
-│   └── figures/                   # 数据和图片
-├── run_HF.py                      # HF计算示例（STO-3G）
-├── run_LSDA.py                    # LSDA计算示例（STO-3G）
-├── run_HF_ps.py                   # HF计算示例（NAO+赝势）
-└── run_LSDA_ps.py                 # LSDA计算示例（NAO+赝势）
+│   ├── lr_tddft.py                # 线性响应TDDFT
+│   ├── rt_tddft.py                # 实时TDDFT
+│   └── visualization.py           # 电子密度/轨道可视化
 ```
 
 ## 快速开始
