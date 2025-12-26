@@ -9,7 +9,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from core import *
 
 # 输出配置
-OUT_DIR = Path(__file__).parent.parent/ "all_results/DFT"
+OUT_DIR = Path(__file__).parent.parent/ "data/DFT"
 if not os.path.exists(OUT_DIR):
     os.makedirs(OUT_DIR)
 
@@ -24,7 +24,7 @@ if __name__ == "__main__":
     ######################################################################
     print("\n[1/4] Running H STO-3G...")
     
-    basis = get_sto3g_basis('H')
+    basis = get_sto3g_basis('H',mesh_size=2000,radius_cutoff=7.0,grid_type='log')
     ints = AtomicIntegrals(basis, nuclear_charge=1, real_basis=real_basis)
 
     # HF
@@ -48,8 +48,8 @@ if __name__ == "__main__":
     ######################################################################
     print("\n[2/4] Running H NAO+Pseudo...")
     
-    basis_path = "SG15-Version1p0__StandardOrbitals-Version2p0/H_gga_6au_100Ry_2s1p.orb"
-    pseudo_path = "SG15-Version1p0_Pseudopotential/SG15_ONCV_v1.0_upf/H_ONCV_PBE-1.0.upf"
+    basis_path = Path(__file__).parent / "H_gga_6au_100Ry_2s1p.orb"
+    pseudo_path = Path(__file__).parent / "H_ONCV_PBE-1.0.upf"
     
     basis = load_basis_set_from_file(basis_path)
     pseudo = load_pseudopotential_from_upf(pseudo_path)
@@ -145,7 +145,7 @@ if __name__ == "__main__":
     # C STO-3G 2p轨道 (Index 4 usually 2pz)
     # 直接调用 core 里的函数
     plot_orbital_contour(all_results['c_sto3g_hf'], orbital_index=2, spin='alpha', 
-                        plane='xz', range_au=5.0)
+                        plane='xy', range_au=5.0)
     plt.savefig(f"{OUT_DIR}/C_sto3g_2p_contour.pdf")
     plt.close()
 

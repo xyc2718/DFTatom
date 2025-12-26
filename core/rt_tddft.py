@@ -30,12 +30,12 @@ class RealTimeTDDFT:
         self.strict_diagonalize = strict_diagonalize
         self.threshold = threshold
         
-        # 1. 基础矩阵 (AO 基组)
+        # 基础矩阵 (AO 基组)
         self.S_ao = ks_results.s
         self.H_core_ao = ks_results.h_core
         self.eri = ks_results.eri
         
-        # 2. 构建正交化变换矩阵 X
+        # 构建正交化变换矩阵 X
         if self.strict_diagonalize:
             # 严格模式：投影到线性无关子空间
             s_vals, U = eigh(self.S_ao)
@@ -55,15 +55,15 @@ class RealTimeTDDFT:
 
         self.D_ao = self.integral_calc.compute_dipole_matrix()
 
-        # 4. 初始化系数矩阵 (始终保持在 AO 空间，形状 N_basis x N_occ)
+        # 初始化系数矩阵
         n_occ_alpha = int(self.ks.occ_alpha.sum())
         n_occ_beta = int(self.ks.occ_beta.sum())
         
-        # 直接复制静态计算的系数 (AO基组)
+        # 复制静态计算的系数 (AO基组)
         self.C_alpha = self.ks.coefficients_alpha[:, :n_occ_alpha].astype(np.complex128)
         self.C_beta = self.ks.coefficients_beta[:, :n_occ_beta].astype(np.complex128)
 
-        # 5. 初始化 helper
+        # 初始化 helper
         self.lsda_helper = lsda_calc
 
         # 历史记录
@@ -153,9 +153,8 @@ class RealTimeTDDFT:
         steps = int(total_time / self.dt)
         logging.info(f"开始通用演化: {total_time} a.u. ({steps} 步)")
         
-        # --- 0. 准备工作 ---
+ 
         # 预计算子空间偶极矩阵 (用于 Kick 或 Laser)
-        # 始终计算所有方向的 D_sub，以备不时之需
         D_sub_all = np.zeros((3, self.S_sub.shape[0], self.S_sub.shape[1]))
         if self.strict_diagonalize:
             for i in range(3):
@@ -168,7 +167,7 @@ class RealTimeTDDFT:
         laser_dir_idx = dir_map[field_direction.lower()]
         D_laser_op = D_sub_all[laser_dir_idx]
 
-        # --- 1. 处理 Delta Kick (t=0 初始化) ---
+        #处理 Delta Kick (t=0 初始化)
         if kick_params:
             k_str = kick_params.get('strength', 0.0)
             k_dir = kick_params.get('direction', 'z')
@@ -196,7 +195,6 @@ class RealTimeTDDFT:
             self.time_history = [0.0]
             self.dipole_history = [self._compute_current_dipole()] # AO空间计算最准
         
-        # --- 2. 准备循环变量 ---
         current_time = 0.0 if not self.time_history else self.time_history[-1]
         
         # 投影系数常驻子空间
@@ -265,7 +263,6 @@ class RealTimeTDDFT:
             H_a_ks = H_a_ks_next
             H_b_ks = H_b_ks_next
             
-            # --- 3. 记录 ---
             current_time += self.dt
             self.time_history.append(current_time)
             
@@ -276,7 +273,7 @@ class RealTimeTDDFT:
             if (step + 1) % print_interval == 0:
                 logging.info(f"Step {step+1}: T={current_time:.2f}, E={field_val:.4f}, Mu_z={mu[2]:.6f}")
 
-        # 循环结束，还原系数
+        # 还原系数
         self.C_alpha = self._from_subspace(c_a_sub)
         self.C_beta = self._from_subspace(c_b_sub)
 
@@ -284,19 +281,19 @@ class RealTimeTDDFT:
         """
         输入 AO 系数，返回子空间 Hamiltonian
         """
-        # 1. 构建 AO 密度 (直接用输入的 AO 系数)
+        # 构建 AO 密度 (直接用输入的 AO 系数)
         P_a_ao = (C_a_ao @ C_a_ao.conj().T).real
         P_b_ao = (C_b_ao @ C_b_ao.conj().T).real
         P_tot_ao = P_a_ao + P_b_ao
         
-        # 2. 构建 AO Hamiltonian
+        # 构建 AO Hamiltonian
         J = self.lsda_helper._build_coulomb_matrix(P_tot_ao, self.eri)
         V_xc_a, V_xc_b, _, _, _ = self.lsda_helper._build_xc_potential_matrix(P_a_ao, P_b_ao)
         
         H_a_ao = self.H_core_ao + J + V_xc_a
         H_b_ao = self.H_core_ao + J + V_xc_b
         
-        # 3. 投影到子空间
+        # 投影到子空间
         if self.strict_diagonalize:
             H_a_sub = self.X.T @ H_a_ao @ self.X
             H_b_sub = self.X.T @ H_b_ao @ self.X

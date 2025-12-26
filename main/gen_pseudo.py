@@ -8,10 +8,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.makedirs(output_dir,exist_ok=True)
 from core import *
 all_results={}
-#basis_set = get_aug_cc_pvtz_basis('Al',radius_cutoff=10.0,mesh_size=500,grid_type='log')
-#basis_set = get_sto3g_basis('Al',radius_cutoff=8.0,grid_type='log',mesh_size=2000)
-basis_set = get_sto6g_basis('Al',radius_cutoff=8.0,grid_type='log',mesh_size=2000)
-integral=AtomicIntegrals(basis_set,13,real_basis=True)
+#basis_set = get_aug_cc_pvtz_basis('Al',radius_cutoff=10.0,mesh_size=1000,grid_type='log')
+basis_set = get_sto3g_basis('Al',radius_cutoff=8.0,grid_type='log',mesh_size=2000)
+#basis_set = get_sto3g_basis('Al',radius_cutoff=8.0,grid_type='log',mesh_size=3000)
+integral=AtomicIntegrals(basis_set,13,real_basis=True, eri_cache=True)
 lsda_calc=AtomicLSDA(integral,damping_factor=0.7,max_iterations=200,strict_diagonalize=True)
 #lsda_calc=AtomicHartreeFock(integral,damping_factor=0.7,max_iterations=200)
 lsda_results=lsda_calc.run_scf()
@@ -20,7 +20,7 @@ lsda_results=lsda_calc.run_scf()
 r_cuts = {'s': 1.6, 'p': 1.6} 
 generator = PseudopotentialGenerator(lsda_results, r_cuts=r_cuts,v_shift=0.0,auto_v_shift=False)
 # 2. 生成赝势 (选择 'p' 通道作为局域势)
-pseudo,basis_set_ps = generator.generate(local_channel="p")
+pseudo,basis_set_ps = generator.generate(local_channel="d")
 
 # 3. 打印信息或保存
 pseudo.print_info()
@@ -55,8 +55,8 @@ xpsd,ypsd=get_radial_data(lsda_results_psd,"alpha",0)
 x,y=get_radial_data(lsda_results,"alpha",5)
 if y[-1]*ypsd[-1]<0:
     ypsd=-ypsd
-plt.plot(x,x*y,label='All-electron 3s',linewidth=2)
-plt.plot(xpsd,xpsd*ypsd,label='Pseudopotential 3s',linewidth=2)
+plt.plot(x,y,label='All-electron 3s',linewidth=2)
+plt.plot(xpsd,ypsd,label='Pseudopotential 3s',linewidth=2)
 plt.xlabel('Radius (Bohr)')
 plt.ylabel('Radial Wavefunction r*R(r)')
 plt.title('Al 3s Orbital Comparison')
@@ -67,8 +67,10 @@ plt.close()
 fig3p=plt.figure(figsize=(8,6))
 xpsd,ypsd=get_radial_data(lsda_results_psd,"alpha",1)
 x,y=get_radial_data(lsda_results,"alpha",6)
-plt.plot(x,x*y,label='All-electron 3p',linewidth=2)
-plt.plot(xpsd,xpsd*ypsd,label='Pseudopotential 3p',linewidth=2)
+plt.plot(x,y,label='All-electron 3p',linewidth=2)
+if ypsd[-1]*y[-1]<0:
+    ypsd=-ypsd
+plt.plot(xpsd,ypsd,label='Pseudopotential 3p',linewidth=2)
 plt.legend()
 plt.xlabel('Radius (Bohr)')
 plt.ylabel('Radial Wavefunction r*R(r)')

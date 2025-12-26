@@ -15,8 +15,7 @@ from scipy.optimize import brentq
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 # --- 交换相关泛函 (XC Functional) 的独立实现 ---
-# 这部分代码实现了完整的、解析的Slater Exchange + VWN5 Correlation
-
+#Slater Exchange + VWN5 Correlation
 def get_slater_vwn5(rho_alpha: np.ndarray, rho_beta: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     计算Slater Exchange + VWN5 Correlation的交换相关势和能量密度。
@@ -133,6 +132,73 @@ def get_slater_vwn5(rho_alpha: np.ndarray, rho_beta: np.ndarray) -> Tuple[np.nda
     
     return v_xc_alpha, v_xc_beta, eps_xc
 
+
+def get_lb94_vwn5(rho_alpha: np.ndarray, rho_beta: np.ndarray, 
+                  grad_rho_alpha: np.ndarray, grad_rho_beta: np.ndarray) -> tuple:
+    """
+    计算 LB94 (van Leeuwen-Baerends) 渐近修正交换相关势。
+    
+    公式: V_LB94 = V_LDA + V_correction
+    其中 V_LDA 直接调用 get_slater_vwn5 获取。
+    
+    Args:
+        rho_alpha: α自旋密度
+        rho_beta:  β自旋密度
+        grad_rho_alpha: α自旋密度梯度的模 |dρ/dr|
+        grad_rho_beta:  β自旋密度梯度的模 |dρ/dr|
+        
+    Returns:
+        (v_xc_alpha, v_xc_beta, eps_xc_lda)
+        注意：LB94 仅修正势(Potential)，不修正能量密度(eps_xc)。
+    """
+    
+    # 1. 调用现有的 LDA 函数获取基础部分
+    v_xc_alpha_lda, v_xc_beta_lda, eps_xc_lda = get_slater_vwn5(rho_alpha, rho_beta)
+    
+    # 2. 定义 LB94 修正项计算函数
+    # 参数 beta = 0.05 (由原始论文确定)
+    BETA = 0.05
+    
+    def compute_lb94_term(rho, grad_rho):
+        """
+        计算单自旋通道的修正势:
+        V_corr = - (beta * x^2 * rho^(1/3)) / (1 + 3 * beta * x * arcsinh(x))
+        其中 x = |grad_rho| / rho^(4/3)
+        """
+        # 防止除以 0
+        rho_safe = np.maximum(rho, 1e-12)
+        
+        # 计算无量纲约化梯度 x
+        # x = |∇ρ| / ρ^(4/3)
+        x = grad_rho / (rho_safe**(4.0/3.0))
+        
+        # 分子: beta * x^2 * rho^(1/3)
+        numerator = BETA * (x**2) * (rho_safe**(1.0/3.0))
+        
+        # 分母: 1 + 3 * beta * x * arcsinh(x)
+        # np.arcsinh 是反双曲正弦
+        denominator = 1.0 + 3.0 * BETA * x * np.arcsinh(x)
+        
+        v_corr = -numerator / denominator
+        
+        # 数值清理：在密度极低处(真空噪声区)，强制修正为 0 或平滑过渡
+        # 虽然 LB94 理论上在远处趋向 -1/r，但如果 rho 接近机器精度，计算会不稳定
+        v_corr[rho < 1e-14] = 0.0
+        
+        return v_corr
+
+    # 3. 计算修正项
+    v_corr_alpha = compute_lb94_term(rho_alpha, grad_rho_alpha)
+    v_corr_beta  = compute_lb94_term(rho_beta,  grad_rho_beta)
+    
+    # 4. 叠加修正
+    v_xc_alpha_final = v_xc_alpha_lda + v_corr_alpha
+    v_xc_beta_final  = v_xc_beta_lda  + v_corr_beta
+    
+    # 返回修正后的势，能量密度保持 LDA 值 (LB94 不是变分的)
+    return v_xc_alpha_final, v_xc_beta_final, eps_xc_lda
+
+
 # --- 主LSDA计算类 ---
 # (与之前版本结构相同，但调用了新的XC泛函)
 @dataclass
@@ -175,7 +241,8 @@ class AtomicLSDA:
                  strict_diagonalize: bool = False,
                  diagonalization_threshold: float = 1e-6,
                  occ_method: str = 'fermi',  # 'fermi' or 'aufbau' or else
-                 temperature: float = 0.005):
+                 temperature: float = 0.005,
+                 functional_type="vwn5"):
         self.integral_calc = integral_calc
         self.n_electrons = n_electrons or self.integral_calc.nuclear_charge
         self.n_basis = self.integral_calc.n_basis
@@ -183,6 +250,7 @@ class AtomicLSDA:
         self.r_squared = self.integral_calc.r_grid**2
         self.strict_diagonalize= strict_diagonalize
         self.diagonalization_threshold = diagonalization_threshold
+        self.functional_type = functional_type
         
         self.multiplicity = multiplicity or self._get_ground_state_multiplicity_default()
         if self.multiplicity is None or self.multiplicity < 1:
@@ -219,6 +287,15 @@ class AtomicLSDA:
         self.eri= self.integral_calc.compute_electron_repulsion_integrals()
         
         logging.info("单电子积分计算完成，开始SCF迭代...")
+
+    def _compute_vxc(self, rho_alpha, rho_beta):
+        if self.functional_type.lower() == "vwn5":
+            return get_slater_vwn5(rho_alpha, rho_beta)
+        elif self.functional_type.lower() == "lb94":
+            # 计算密度梯度的模
+            grad_rho_alpha = np.abs(np.gradient(rho_alpha, self.r_grid))
+            grad_rho_beta = np.abs(np.gradient(rho_beta, self.r_grid))
+            return get_lb94_vwn5(rho_alpha, rho_beta, grad_rho_alpha, grad_rho_beta)
     
     def _get_ground_state_multiplicity_default(self) -> int:
         multiplicities = {"H": 2, "He": 1, "Li": 2, "Be": 1, "B": 2, "C": 3, "N": 4, "O": 3, "F": 2, "Ne": 1,"Al":2}
@@ -346,7 +423,7 @@ class AtomicLSDA:
 
         rho_alpha_3d, rho_alpha_radial = self._calculate_electron_density_on_grid(P_alpha)
         rho_beta_3d, rho_beta_radial = self._calculate_electron_density_on_grid(P_beta)
-        v_xc_alpha_grid, v_xc_beta_grid, _ = get_slater_vwn5(rho_alpha_3d, rho_beta_3d)
+        v_xc_alpha_grid, v_xc_beta_grid, _ =self._compute_vxc(rho_alpha_3d, rho_beta_3d)
         
         # 2. 计算最终的 Hartree 势网格值
         rho_radial_total = rho_alpha_radial + rho_beta_radial
@@ -482,7 +559,7 @@ class AtomicLSDA:
         rho_beta_3d, rho_beta_radial = self._calculate_electron_density_on_grid(P_beta)
 
         #计算XC势网格值
-        v_xc_alpha_grid, v_xc_beta_grid, eps_xc_grid = get_slater_vwn5(rho_alpha_3d, rho_beta_3d)
+        v_xc_alpha_grid, v_xc_beta_grid, eps_xc_grid = self._compute_vxc(rho_alpha_3d, rho_beta_3d)
 
         #计算矩阵元 
         radial_funcs = self.integral_calc.radial_functions

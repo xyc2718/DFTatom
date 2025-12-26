@@ -7,9 +7,10 @@ from scipy.linalg import eigh
 from dataclasses import dataclass
 from typing import List
 import logging
+import matplotlib.pyplot as plt # 导入绘图库
 
 # 导入 AtomicLSDA 以便类型检查 (可选)
-from .LSDA import AtomicLSDA, get_slater_vwn5,KSResults
+from .LSDA import AtomicLSDA, get_slater_vwn5, KSResults,get_lb94_vwn5
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -35,18 +36,14 @@ class LinearResponseTDDFT:
                          (需要包含 .ks_results 属性，或者你可以修改这里从外部传入结果)
         """
         self.lsda = lsda_solver
-        
-        # 假设 AtomicLSDA 运行完 run_scf 后会把结果保存在 self.ks_results 中
-        # 如果你的 AtomicLSDA 没有保存这个属性，你需要修改 AtomicLSDA 或者在这里额外传入 ks_results
         self.ks = ks_results
 
-        # 直接复用 LSDA 的组件，无需重新初始化
         self.integral = self.lsda.integral_calc
         self.lsda_helper = self.lsda  
         
         self.n_basis = self.integral.n_basis
         
-        # 1. 整理轨道信息
+        # 整理轨道信息
         self.occ_idxs_a, self.virt_idxs_a = self._classify_orbitals(
             self.ks.occ_alpha, self.ks.orbital_energies_alpha
         )
@@ -62,6 +59,10 @@ class LinearResponseTDDFT:
         self.dim_a = self.n_occ_a * self.n_virt_a
         self.dim_b = self.n_occ_b * self.n_virt_b
         self.total_dim = self.dim_a + self.dim_b
+        
+        # 初始化存储变量 
+        self.excitation_energies = None
+        self.oscillator_strengths = None
         
         logging.info(f"初始化 LR-TDDFT (TDA) based on LSDA Solver:")
         logging.info(f"  Alpha: {self.n_occ_a} occ -> {self.n_virt_a} virt")
@@ -81,10 +82,8 @@ class LinearResponseTDDFT:
         return occ_idxs, virt_idxs
 
     def solve(self, n_states: int = 10) -> List[Excitation]:
-        # ... (solve 方法内部代码完全不变，因为它使用的是 self.ks 和 self.lsda_helper) ...
-        # ... 只需确保 _compute_xc_kernel_matrix 里调用的是 self.lsda_helper ...
-        
-        # 复制之前的 solve 代码 ...
+        """求解 Casida 方程，返回激发态列表"""
+
         logging.info("构建 Casida 矩阵...")
         A = np.zeros((self.total_dim, self.total_dim))
         
@@ -120,6 +119,8 @@ class LinearResponseTDDFT:
         
         logging.info("求解特征值问题...")
         evals, evecs = eigh(A)
+        self.A=A
+        logging.info(f"Raw Eigenvalues (Hartree): {evals[:5]}")
         
         results = []
         dip_mo_a = self._compute_transition_dipoles(C_a, self.occ_idxs_a, self.virt_idxs_a)
@@ -127,6 +128,10 @@ class LinearResponseTDDFT:
         flat_dip_a = dip_mo_a.reshape(3, self.dim_a)
         flat_dip_b = dip_mo_b.reshape(3, self.dim_b)
         
+        # 用于临时存储结果的列表
+        temp_energies = []
+        temp_osc_strs = []
+
         for n in range(min(n_states, len(evals))):
             omega = evals[n]
             if omega < 1e-3: continue
@@ -136,6 +141,10 @@ class LinearResponseTDDFT:
             osc_str = (2.0 / 3.0) * omega * np.sum(D_vec**2)
             contributions = self._analyze_composition(X)
             
+            # 记录数据以便画图
+            temp_energies.append(omega * 27.2114) # 存 eV
+            temp_osc_strs.append(osc_str)
+
             results.append(Excitation(
                 energy_hartree=omega,
                 energy_ev=omega * 27.2114,
@@ -144,10 +153,12 @@ class LinearResponseTDDFT:
                 contributions=contributions
             ))
             
+        #保存结果到 self，供后续画图使用
+        self.excitation_energies = np.array(temp_energies)
+        self.oscillator_strengths = np.array(temp_osc_strs)
+
         return results
 
-    # ... _transform_eri, _transform_eri_mixed, _get_trans_dens, _compute_transition_dipoles, _analyze_composition 保持不变 ...
-    # ... 只需要复制过来即可 ...
 
     def _transform_eri(self, C1, C2, occ_idxs, virt_idxs):
         """MO 积分变换"""
@@ -176,48 +187,118 @@ class LinearResponseTDDFT:
         temp3 = np.einsum('ials,lj->iajs', temp2, C_occ_b)
         mo_eri = np.einsum('iajs,sb->iajb', temp3, C_virt_b)
         return mo_eri
+    
     def _compute_xc_kernel_matrix(self):
-        """通过数值差分计算 f_xc 矩阵元"""
-        logging.info("计算 XC Kernel (数值差分)...")
+        """
+        通过数值差分计算 f_xc 矩阵元。
+        支持 GGA 泛函 (LB94) 的梯度依赖。
         
-        # 1. 计算密度
-        rho_a_3d, _ = self.lsda_helper._calculate_electron_density_on_grid(self.ks.density_matrix_alpha)
-        rho_b_3d, _ = self.lsda_helper._calculate_electron_density_on_grid(self.ks.density_matrix_beta)
+        包含修正:
+        1. 密度截断 (Cutoff): 避免在极低密度区产生数值发散。
+        2. 自适应步长 (Adaptive Delta): 确保差分求导的数值稳定性。
+        3. 核限幅 (Kernel Clamping): 防止非物理的强排斥/吸引。
+        4. 正确的网格积分权重 (dV = 4pi * r^2 * dr)。
+        """
+        import logging
+        import numpy as np
         
-        # 2. dV/drho (f_xc)
-        delta = 1e-4
-        v_xa_0, v_xb_0, _ = get_slater_vwn5(rho_a_3d, rho_b_3d)
+        # 确定当前的泛函类型
+        func_type = getattr(self.lsda_helper, 'functional_type', 'lda').lower()
+        logging.info(f"计算 XC Kernel (基于 {func_type.upper()} 泛函的数值差分)...")
         
-        v_xa_p, v_xb_p_cross, _ = get_slater_vwn5(rho_a_3d + delta, rho_b_3d)
-        fxc_aa = (v_xa_p - v_xa_0) / delta
-        fxc_ba = (v_xb_p_cross - v_xb_0) / delta 
+        # 1. 在网格上获取密度及其梯度 (LB94 必须需要梯度项)
+        # 假设 lsda_helper._calculate_electron_density_on_grid 返回 (density, gradient)
+        rho_a, grad_a = self.lsda_helper._calculate_electron_density_on_grid(self.ks.density_matrix_alpha)
+        rho_b, grad_b = self.lsda_helper._calculate_electron_density_on_grid(self.ks.density_matrix_beta)
         
-        v_xa_p_cross, v_xb_p, _ = get_slater_vwn5(rho_a_3d, rho_b_3d + delta)
-        fxc_bb = (v_xb_p - v_xb_0) / delta
+        rho_tot = rho_a + rho_b
         
-        # 3. 计算跃迁密度
+        # 截断阈值：过低的密度区不参与差分计算
+        cutoff_threshold = 1e-12
+        mask = rho_tot > cutoff_threshold
+        
+        # 初始化 fxc 矩阵元数组
+        fxc_aa = np.zeros_like(rho_a)
+        fxc_bb = np.zeros_like(rho_b)
+        fxc_ba = np.zeros_like(rho_a)
+        
+        if np.any(mask):
+            ra = rho_a[mask]
+            rb = rho_b[mask]
+            ga = grad_a[mask]
+            gb = grad_b[mask]
+            
+            # 自适应步长：步长随密度大小调整，确保数值求导的精度
+            delta_a = np.maximum(0.01 * ra, 1e-10)
+            delta_b = np.maximum(0.01 * rb, 1e-10)
+            
+            if func_type == 'lb94':
+                # --- LB94 路径：必须传入 4 个参数 (rho_a, rho_b, grad_a, grad_b) ---
+                # 获取基础势能
+                v_xa_0, v_xb_0, _ = get_lb94_vwn5(ra, rb, ga, gb)
+                
+                # 扰动 Alpha 密度，保持当前梯度不变 (绝热近似)
+                v_xa_p, v_xb_p_cross, _ = get_lb94_vwn5(ra + delta_a, rb, ga, gb)
+                val_aa = (v_xa_p - v_xa_0) / delta_a
+                val_ba = (v_xb_p_cross - v_xb_0) / delta_a 
+                
+                # 扰动 Beta 密度
+                v_xa_p_cross, v_xb_p, _ = get_lb94_vwn5(ra, rb + delta_b, ga, gb)
+                val_bb = (v_xb_p - v_xb_0) / delta_b
+            else:
+                # --- LDA 路径：仅需 2 个参数 (rho_a, rho_b) ---
+                v_xa_0, v_xb_0, _ = get_slater_vwn5(ra, rb)
+                
+                v_xa_p, v_xb_p_cross, _ = get_slater_vwn5(ra + delta_a, rb)
+                val_aa = (v_xa_p - v_xa_0) / delta_a
+                val_ba = (v_xb_p_cross - v_xb_0) / delta_a 
+                
+                v_xa_p_cross, v_xb_p, _ = get_slater_vwn5(ra, rb + delta_b)
+                val_bb = (v_xb_p - v_xb_0) / delta_b
+            
+            # 核限幅 (Kernel Clamping)：防止数值奇异性
+            clamp_min = -10.0
+            fxc_aa[mask] = np.clip(val_aa, clamp_min, None)
+            fxc_bb[mask] = np.clip(val_bb, clamp_min, None)
+            fxc_ba[mask] = np.clip(val_ba, clamp_min, None)
+
+        # 2. 获取跃迁密度 rho_ia(r)
         td_a = self._get_trans_dens(self.ks.coefficients_alpha, self.occ_idxs_a, self.virt_idxs_a)
         td_b = self._get_trans_dens(self.ks.coefficients_beta, self.occ_idxs_b, self.virt_idxs_b)
         
-        # 4. 积分
-        vol_element = 4.0 * np.pi * self.integral.r_grid**2
+        # 3. 计算对数网格下的体积元 dV = 4 * pi * r^2 * dr
+        r = self.integral.r_grid
+        dr = np.gradient(r)
+        vol_element = 4.0 * np.pi * (r**2) * dr
         
         def integrate_kernel(td1, fxc, td2):
+            """执行数值积分: ∫ rho_ia(r) * fxc(r) * rho_jb(r) dV"""
+            if td1.shape[0] == 0 or td2.shape[0] == 0:
+                return np.zeros((td1.shape[0], td2.shape[0]))
+            
+            # 广播计算: td2(N_ia, N_grid) * fxc(N_grid) * dV(N_grid)
             weighted_td2 = td2 * fxc[None, :] * vol_element[None, :]
+            # 矩阵乘法完成空间求和
             return np.dot(td1, weighted_td2.T)
 
-        # --- 修复点：使用正确的 n_occ 和 n_virt 进行 Reshape ---
-        # K_aa 形状: (dim_a, dim_a) -> (ia, jb) -> (i, a, j, b)
-        K_aa_2d = integrate_kernel(td_a, fxc_aa, td_a)
-        K_aa = K_aa_2d.reshape(self.n_occ_a, self.n_virt_a, self.n_occ_a, self.n_virt_a)
+        # 4. 构建耦合矩阵项
+        K_aa = integrate_kernel(td_a, fxc_aa, td_a).reshape(
+            self.n_occ_a, self.n_virt_a, self.n_occ_a, self.n_virt_a
+        )
         
-        # K_bb 形状: (dim_b, dim_b) -> (i, a, j, b) [Beta]
-        K_bb_2d = integrate_kernel(td_b, fxc_bb, td_b)
-        K_bb = K_bb_2d.reshape(self.n_occ_b, self.n_virt_b, self.n_occ_b, self.n_virt_b)
-        
-        # K_ab 形状: (dim_a, dim_b) -> (i_a, a_a, j_b, b_b)
-        K_ab_2d = integrate_kernel(td_a, fxc_ba, td_b)
-        K_ab = K_ab_2d.reshape(self.n_occ_a, self.n_virt_a, self.n_occ_b, self.n_virt_b)
+        if self.n_occ_b > 0 and self.n_virt_b > 0:
+            K_bb = integrate_kernel(td_b, fxc_bb, td_b).reshape(
+                self.n_occ_b, self.n_virt_b, self.n_occ_b, self.n_virt_b
+            )
+        else:
+            K_bb = np.zeros((self.n_occ_b, self.n_virt_b, self.n_occ_b, self.n_virt_b))
+            
+        if self.n_occ_a > 0 and self.n_virt_b > 0:
+            K_ab = integrate_kernel(td_a, fxc_ba, td_b).reshape(
+                self.n_occ_a, self.n_virt_a, self.n_occ_b, self.n_virt_b
+            )
+        else:
+            K_ab = np.zeros((self.n_occ_a, self.n_virt_a, self.n_occ_b, self.n_virt_b))
         
         return K_aa, K_bb, K_ab
     def _get_trans_dens(self, C, occs, virts):
@@ -237,11 +318,8 @@ class LinearResponseTDDFT:
         return dens_grid
 
     def _compute_transition_dipoles(self, C, occs, virts):
-        if 'dipole' in self.integral.compute_all_integrals():
-            D_ao = self.integral.compute_all_integrals()['dipole']
-        else:
-            D_ao = self.integral.compute_dipole_matrix()
-            
+    
+        D_ao = self.integral.compute_dipole_matrix()
         dim = len(occs) * len(virts)
         dipoles = np.zeros((3, dim))
         idx = 0
@@ -255,30 +333,164 @@ class LinearResponseTDDFT:
         return dipoles
 
     def _analyze_composition(self, eigenvector):
-        threshold = 0.1
+        """
+        分析激发态特征向量，解析 MO 的主要成分。
+        利用 AtomicOrbital.orbital_name 直接获取轨道名称。
+        """
+        threshold = 0.01
         comps = []
-        try:
-            names = self.integral.basis.get_orbital_names()
-        except:
-            names = [f"Orb{i}" for i in range(self.n_basis)]
+        
+        # 获取基组中的原子轨道列表
+        orbitals = self.integral.basis.orbitals
+        
+        # --- 内部函数：查找 MO 的主要成分名称 ---
+        def get_mo_label(mo_idx, coeffs):
+            """
+            查找 MO 中系数最大的基函数，并返回其名称
+            Args:
+                mo_idx: 分子轨道(MO)的全局索引
+                coeffs: 系数矩阵 (n_basis, n_orbitals)
+            """
+            # 获取该 MO 在所有基函数上的系数向量
+            c_vec = coeffs[:, mo_idx]
+            
+            # 找到贡献最大的基函数索引 (绝对值最大)
+            dom_idx = np.argmax(np.abs(c_vec))
+            
+            # 直接使用 AtomicOrbital 类中预计算好的 orbital_name
+            return orbitals[dom_idx].orbital_name
 
+        # 1. 遍历 Alpha 通道跃迁
         for idx in range(self.dim_a):
             coeff = eigenvector[idx]
+            
+            # 只显示贡献显著的成分
             if abs(coeff) ** 2 > threshold:
+                # 解析 Casida 向量索引对应的 i (占据) 和 a (虚)
                 i_local = idx // self.n_virt_a
                 a_local = idx % self.n_virt_a
-                i_idx = self.occ_idxs_a[i_local]
-                a_idx = self.virt_idxs_a[a_local]
-                comps.append(f"{names[i_idx]}(a)->{names[a_idx]}(a) ({coeff:.2f})")
                 
+                # 转换回全局 MO 索引
+                i_global = self.occ_idxs_a[i_local]
+                a_global = self.virt_idxs_a[a_local]
+                
+                # 获取 MO 的主要成分名称
+                name_i = get_mo_label(i_global, self.ks.coefficients_alpha)
+                name_a = get_mo_label(a_global, self.ks.coefficients_alpha)
+                
+                comps.append(f"{name_i}(a)->{name_a}(a) ({coeff:.2f})")
+                
+        # 2. 遍历 Beta 通道跃迁 (如果有)
         for idx in range(self.dim_b):
             global_idx = idx + self.dim_a
             coeff = eigenvector[global_idx]
+            
             if abs(coeff) ** 2 > threshold:
                 i_local = idx // self.n_virt_b
                 a_local = idx % self.n_virt_b
-                i_idx = self.occ_idxs_b[i_local]
-                a_idx = self.virt_idxs_b[a_local]
-                comps.append(f"{names[i_idx]}(b)->{names[a_idx]}(b) ({coeff:.2f})")
+                
+                i_global = self.occ_idxs_b[i_local]
+                a_global = self.virt_idxs_b[a_local]
+                
+                name_i = get_mo_label(i_global, self.ks.coefficients_beta)
+                name_a = get_mo_label(a_global, self.ks.coefficients_beta)
+                
+                comps.append(f"{name_i}(b)->{name_a}(b) ({coeff:.2f})")
                 
         return comps
+
+    def get_absorption_spectrum(self, 
+                                start_ev: float = None, 
+                                end_ev: float = None, 
+                                step: float = 0.01, 
+                                sigma: float = 0.4, 
+                                kind: str = 'gaussian'):
+        """
+        根据计算出的激发态，生成吸收光谱曲线数据。
+        
+        Args:
+            start_ev: 光谱起始能量 (eV)。默认自动根据最低激发能设定。
+            end_ev:   光谱结束能量 (eV)。默认自动根据最高激发能设定。
+            step:     能量网格步长 (eV)。
+            sigma:    展宽参数 (eV)。
+                      - 对于 'gaussian': 代表标准差 (FWHM ≈ 2.355 * sigma)
+                      - 对于 'lorentzian': 代表半高宽的一半 (HWHM)
+            kind:     展宽函数类型 ('gaussian' 或 'lorentzian')。
+            
+        Returns:
+            energies (np.ndarray): X轴，能量点
+            intensities (np.ndarray): Y轴，吸收强度 (任意单位)
+        """
+        if self.excitation_energies is None:
+            raise ValueError("尚未计算激发态，请先运行 solve() 或 compute_excited_states()")
+
+        # 1. 确定光谱范围
+        if start_ev is None:
+            start_ev = max(0.0, min(self.excitation_energies) - 2.0)
+        if end_ev is None:
+            end_ev = max(self.excitation_energies) + 2.0
+            
+        n_points = int((end_ev - start_ev) / step) + 1
+        x_grid = np.linspace(start_ev, end_ev, n_points)
+        y_grid = np.zeros_like(x_grid)
+        
+        # 2. 叠加每一个激发态的展宽函数
+        for E_n, f_n in zip(self.excitation_energies, self.oscillator_strengths):
+            # 忽略振子强度极小的态 (加速计算)
+            if f_n < 1e-6:
+                continue
+                
+            if kind == 'gaussian':
+                # 高斯函数
+                prefactor = 1.0 / (sigma * np.sqrt(2.0 * np.pi))
+                y_grid += f_n * prefactor * np.exp(-((x_grid - E_n)**2) / (2 * sigma**2))
+                
+            elif kind == 'lorentzian':
+                # 洛伦兹函数
+                prefactor = 1.0 / np.pi
+                y_grid += f_n * prefactor * (sigma / ((x_grid - E_n)**2 + sigma**2))
+            else:
+                raise ValueError(f"不支持的展宽类型: {kind}")
+                
+        return x_grid, y_grid
+
+    def plot_absorption_spectrum(self, 
+                                 filename: str = None, 
+                                 title: str = "Simulated UV-Vis Spectrum", 
+                                 sigma: float = 0.3,
+                                 kind: str = 'gaussian',
+                                 start_ev: float = None,
+                                 end_ev: float = None,):
+        """
+        直接绘制并显示/保存吸收光谱图。
+        """
+        
+        # 获取数据
+        x, y = self.get_absorption_spectrum(sigma=sigma, kind=kind,start_ev=start_ev,end_ev=end_ev)
+        
+        # 绘图
+        plt.figure(figsize=(8, 5), dpi=120)
+        
+        # 绘制平滑曲线
+        plt.plot(x, y, label=f'Broadening: {kind.capitalize()} ($\sigma$={sigma} eV)', color='b', linewidth=2)
+        
+        # 绘制离散的棒状图 (Stick Spectrum) 以指示精确位置
+        max_y = np.max(y) if np.max(y) > 1e-6 else 1.0
+        max_f = np.max(self.oscillator_strengths) if np.max(self.oscillator_strengths) > 1e-6 else 1.0
+        scale_factor = max_y / max_f
+        
+        plt.vlines(self.excitation_energies, 0, self.oscillator_strengths * scale_factor, 
+                   colors='r', linestyle='--', alpha=0.5, label='Oscillator Strength (Scaled)')
+        
+        plt.xlabel("Energy (eV)", fontsize=12)
+        plt.ylabel("Intensity (arb. units)", fontsize=12)
+        plt.title(title, fontsize=14)
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        plt.tight_layout()
+        
+        if filename:
+            plt.savefig(filename)
+            print(f"光谱图已保存至: {filename}")
+        else:
+            plt.show()
