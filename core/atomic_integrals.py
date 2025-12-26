@@ -650,6 +650,8 @@ class AtomicIntegrals:
         final_integrand = rho1 * I
         
         integral_value = simpson(final_integrand, x=r_grid)
+        if self.eri_cache:
+            self._radial_cache[cache_key] = integral_value
 
         return integral_value
     

@@ -1,334 +1,342 @@
 """
 tddft_rt.py - 实时时间相关密度泛函理论 (RT-TDDFT) 模块
-用于模拟电子在时域内的演化并计算光吸收谱
+特性：
+1. 支持 strict_diagonalize 处理 aug-cc-pvtz 等病态基组
+2. 始终保持系数矩阵 C 为原始 AO 基组形状 (N_basis x N_occ)，方便可视化
 """
 
 import numpy as np
-from scipy.linalg import solve, inv, expm
-from scipy.integrate import simpson
+from scipy.linalg import solve, eigh
 from scipy.fftpack import fft, fftfreq
 import logging
-from typing import Dict, Tuple, List, Optional
-import matplotlib.pyplot as plt
+from typing import Dict, Tuple
 
-from .LSDA import KSResults, AtomicLSDA, get_slater_vwn5
+from .LSDA import KSResults, AtomicLSDA
 
-# 配置日志
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 class RealTimeTDDFT:
     """
     实时 TDDFT 计算类
-    使用 Crank-Nicolson 传播子求解含时 Kohn-Sham 方程
+    使用 Crank-Nicolson 传播子 (Predictor-Corrector)
     """
 
-    def __init__(self, ks_results: KSResults, dt: float = 0.05):
-        """
-        初始化 RT-TDDFT 模拟器
-
-        Args:
-            ks_results: 基态 LSDA 计算结果
-            dt: 时间步长 (atomic units, 1 a.u. time ≈ 24 as)
-        """
+    def __init__(self, ks_results: KSResults, lsda_calc: AtomicLSDA, dt: float = 0.05, 
+                 strict_diagonalize: bool = False, threshold: float = 1e-4):
         self.ks = ks_results
         self.integral_calc = ks_results.integral_calc
         self.n_basis = self.integral_calc.n_basis
         self.dt = dt
+        self.strict_diagonalize = strict_diagonalize
+        self.threshold = threshold
         
-        # 基础矩阵 (S, T, V_nuc)
-        self.S = self.integral_calc.compute_overlap_matrix()
-        self.H_core = self.integral_calc.compute_core_hamiltonian()
-        self.eri = self.integral_calc.compute_electron_repulsion_integrals()
+        # 1. 基础矩阵 (AO 基组)
+        self.S_ao = ks_results.s
+        self.H_core_ao = ks_results.h_core
+        self.eri = ks_results.eri
         
-        # 偶极矩阵 (用于 Kick 和 观测) [3, n_basis, n_basis]
-        # 假设 atomic_integrals 已经实现了 compute_dipole_matrix
-        if 'dipole' in self.integral_calc.compute_all_integrals():
-            self.D = self.integral_calc.compute_all_integrals()['dipole']
+        # 2. 构建正交化变换矩阵 X
+        if self.strict_diagonalize:
+            # 严格模式：投影到线性无关子空间
+            s_vals, U = eigh(self.S_ao)
+            mask = s_vals > self.threshold
+            s_reg = s_vals[mask]
+            U_reg = U[:, mask]
+            
+            # X 形状: (n_basis, n_valid)
+            self.X = U_reg / np.sqrt(s_reg)
+            self.S_sub = np.eye(self.X.shape[1]) # 子空间重叠矩阵是单位阵
+            logging.info(f"RT-TDDFT 启用严格对角化: 有效维度 {self.X.shape[1]} / {self.n_basis}")
         else:
-            # 如果未缓存，现场计算
-            self.D = self.integral_calc.compute_dipole_matrix()
+            # 普通模式
+            self.X = None
+            self.S_sub = self.S_ao
+            logging.info(f"RT-TDDFT 标准模式: 维度 {self.n_basis}")
 
-        # 初始化复数系数矩阵 (Alpha / Beta)
-        # 形状: [n_basis, n_occ] (只传播占据轨道以节省时间)
-        self.C_alpha = self.ks.coefficients_alpha[:, :self.ks.occ_alpha.sum().astype(int)].astype(np.complex128)
-        self.C_beta = self.ks.coefficients_beta[:, :self.ks.occ_beta.sum().astype(int)].astype(np.complex128)
+        self.D_ao = self.integral_calc.compute_dipole_matrix()
+
+        # 4. 初始化系数矩阵 (始终保持在 AO 空间，形状 N_basis x N_occ)
+        n_occ_alpha = int(self.ks.occ_alpha.sum())
+        n_occ_beta = int(self.ks.occ_beta.sum())
         
-        # 记录占据数 (用于构建密度矩阵)
-        # 在 RT-TDDFT 中，轨道占据数通常随时间保持不变 (幺正演化)
-        self.n_occ_alpha = self.C_alpha.shape[1]
-        self.n_occ_beta = self.C_beta.shape[1]
+        # 直接复制静态计算的系数 (AO基组)
+        self.C_alpha = self.ks.coefficients_alpha[:, :n_occ_alpha].astype(np.complex128)
+        self.C_beta = self.ks.coefficients_beta[:, :n_occ_beta].astype(np.complex128)
+
+        # 5. 初始化 helper
+        self.lsda_helper = lsda_calc
 
         # 历史记录
         self.time_history = []
-        self.dipole_history = [] # 记录 [mu_x, mu_y, mu_z]
+        self.dipole_history = []
+    def _compute_dipole_subspace(self, c_a_sub, c_b_sub, D_sub) -> np.ndarray:
+        """
+        在子空间计算偶极矩: Tr(P_sub @ D_sub)
+        比 AO 空间计算快得多
+        """
+        # 构建子空间密度
+        P_a = (c_a_sub @ c_a_sub.conj().T).real
+        P_b = (c_b_sub @ c_b_sub.conj().T).real
+        P_tot = P_a + P_b
         
-        # 辅助工具：AtomicLSDA 实例 (用于复用势构建逻辑)
-        # 我们创建一个轻量级的实例，主要用它的 grid 和方法
-        self.lsda_helper = AtomicLSDA(self.integral_calc, 
-                                      n_electrons=self.ks.occ_alpha.sum()+self.ks.occ_beta.sum(),
-                                      multiplicity=1) # 参数不重要，只用方法
+        mu = np.zeros(3)
+        for i in range(3):
+            # 这里的矩阵乘法维度是 (n_valid, n_valid)，远小于 (n_basis, n_basis)
+            mu[i] = np.sum(P_tot * D_sub[i].T)
+        return mu
 
-        logging.info(f"RT-TDDFT 初始化完成。时间步长 dt = {self.dt} a.u.")
+    def _to_subspace(self, C_ao):
+        """将 AO 系数投影到计算子空间"""
+        if self.strict_diagonalize:
+            # 投影公式: C_sub = X.T @ S @ C_ao
+            return self.X.T @ self.S_ao @ C_ao
+        else:
+            return C_ao
+
+    def _from_subspace(self, C_sub):
+        """将子空间系数还原回 AO 系数"""
+        if self.strict_diagonalize:
+            # 还原公式: C_ao = X @ C_sub
+            return self.X @ C_sub
+        else:
+            return C_sub
 
     def apply_delta_kick(self, strength: float = 0.001, direction: str = 'z'):
-        """
-        在 t=0 时刻施加 Delta 脉冲电场激发 (Delta Kick)
-        V_ext(t) = - k * δ(t) * r_direction
-        
-        等效于对波函数施加相位因子: ψ(0+) = exp(i * k * r) * ψ(0)
-        
-        Args:
-            strength (k): 激发电场强度 (通常取小值，如 0.001 - 0.01 a.u.)
-            direction: 电场方向 'x', 'y', 'z'
-        """
-        logging.info(f"施加 Delta Kick: 强度={strength}, 方向={direction}")
-        
         dir_map = {'x': 0, 'y': 1, 'z': 2}
         idx = dir_map[direction.lower()]
         
-        # 获取对应方向的偶极矩阵 D_dir
-        D_dir = self.D[idx]
+        # 1. 准备子空间矩阵
+        if self.strict_diagonalize:
+            D_op = self.X.T @ self.D_ao[idx] @ self.X
+        else:
+            D_op = self.D_ao[idx]
+            
+        # 2. 投影系数到子空间
+        c_a_sub = self._to_subspace(self.C_alpha)
+        c_b_sub = self._to_subspace(self.C_beta)
         
-        # 计算 Kick 算符 U = exp(i * k * z)
-        # 在非正交基组下，这比较复杂。
-        # 两种近似方法：
-        # 1. 严格法：C_new = expm(i * k * S^-1 * D) @ C_old
-        # 2. Crank-Nicolson Kick (保持幺正性): (S - i*k/2 * D) C_new = (S + i*k/2 * D) C_old
+        # 3. 执行 Kick (在子空间求解)
+        # (S_sub - i*k/2*D) C_new = (S_sub + i*k/2*D) C_old
+        factor = 1j * (strength / 2.0)
+        LHS = self.S_sub - factor * D_op
+        RHS = self.S_sub + factor * D_op
         
-        # 这里使用方法 2 (CN Kick)，数值上更稳定且不需要计算矩阵指数
-        # LHS * C_new = RHS * C_old
-        LHS = self.S - 1j * (strength / 2.0) * D_dir
-        RHS = self.S + 1j * (strength / 2.0) * D_dir
+        c_a_new = solve(LHS, RHS @ c_a_sub)
+        c_b_new = solve(LHS, RHS @ c_b_sub)
         
-        # 更新系数
-        # 注意：solve(A, b) 解 Ax = b
-        self.C_alpha = solve(LHS, RHS @ self.C_alpha)
-        self.C_beta  = solve(LHS, RHS @ self.C_beta)
+        # 4. 还原系数到 AO 空间并保存
+        self.C_alpha = self._from_subspace(c_a_new)
+        self.C_beta = self._from_subspace(c_b_new)
         
         # 重置历史
         self.time_history = [0.0]
         self.dipole_history = [self._compute_current_dipole()]
+        logging.info(f"Kick 施加成功 (方向 {direction})")
 
-    def propagate(self, total_time: float, print_interval: int = 100):
+    def propagate(self, total_time: float, 
+                  kick_params: dict = None, 
+                  field_func = None, 
+                  field_direction: str = 'z',
+                  print_interval: int = 100):
         """
-        时间传播主循环
+        通用的时间演化函数 (支持 Delta Kick 和 任意激光场)
         
         Args:
-            total_time: 总模拟时间 (a.u.)
-            print_interval: 打印进度的步数间隔
+            total_time: 总演化时间 (a.u.)
+            kick_params: 字典 {'strength': float, 'direction': str}. 
+                         如果存在，在 t=0 施加瞬时相位激发。
+            field_func: 函数 f(t) -> float. 返回 t 时刻的电场强度 E(t)。
+                        如果为 None，则进行自由演化。
+            field_direction: 外场 f(t) 的极化方向 ('x', 'y', 'z')。
+            print_interval: 打印间隔。
         """
         steps = int(total_time / self.dt)
-        logging.info(f"开始时间演化: 总时间 {total_time} a.u., 总步数 {steps}")
+        logging.info(f"开始通用演化: {total_time} a.u. ({steps} 步)")
         
-        current_time = 0.0
-        if len(self.time_history) > 0:
-            current_time = self.time_history[-1]
+        # --- 0. 准备工作 ---
+        # 预计算子空间偶极矩阵 (用于 Kick 或 Laser)
+        # 始终计算所有方向的 D_sub，以备不时之需
+        D_sub_all = np.zeros((3, self.S_sub.shape[0], self.S_sub.shape[1]))
+        if self.strict_diagonalize:
+            for i in range(3):
+                D_sub_all[i] = self.X.T @ self.D_ao[i] @ self.X
+        else:
+            D_sub_all = self.D_ao
 
-        # 预计算 S 的逆或者 LU 分解可能加速，但 S + i*dt/2*H 是变化的，无法预计算 LHS
+        # 确定激光方向索引
+        dir_map = {'x': 0, 'y': 1, 'z': 2}
+        laser_dir_idx = dir_map[field_direction.lower()]
+        D_laser_op = D_sub_all[laser_dir_idx]
+
+        # --- 1. 处理 Delta Kick (t=0 初始化) ---
+        if kick_params:
+            k_str = kick_params.get('strength', 0.0)
+            k_dir = kick_params.get('direction', 'z')
+            idx = dir_map[k_dir.lower()]
+            D_kick = D_sub_all[idx]
+            
+            logging.info(f"应用 Delta Kick: strength={k_str}, dir={k_dir}")
+            
+            # (S - ik/2 D) C = (S + ik/2 D) C
+            factor = 1j * (k_str / 2.0)
+            LHS = self.S_sub - factor * D_kick
+            RHS = self.S_sub + factor * D_kick
+            
+            # 将当前系数投影到子空间 -> Kick -> 更新
+            c_a_sub = self._to_subspace(self.C_alpha)
+            c_b_sub = self._to_subspace(self.C_beta)
+            c_a_sub = solve(LHS, RHS @ c_a_sub)
+            c_b_sub = solve(LHS, RHS @ c_b_sub)
+            
+            # 更新类成员
+            self.C_alpha = self._from_subspace(c_a_sub)
+            self.C_beta = self._from_subspace(c_b_sub)
+            
+            # 重置历史
+            self.time_history = [0.0]
+            self.dipole_history = [self._compute_current_dipole()] # AO空间计算最准
         
+        # --- 2. 准备循环变量 ---
+        current_time = 0.0 if not self.time_history else self.time_history[-1]
+        
+        # 投影系数常驻子空间
+        c_a_sub = self._to_subspace(self.C_alpha)
+        c_b_sub = self._to_subspace(self.C_beta)
+        
+        # 初始 Hamiltonian (仅 KS 部分)
+        H_a_ks, H_b_ks = self._build_hamiltonian_subspace(self.C_alpha, self.C_beta)
+        
+        # 预计算常数
+        factor_plus = 1j * (self.dt / 2.0)
+        factor_minus = -1j * (self.dt / 2.0)
+
         for step in range(steps):
-            # 1. 构建当前时刻的哈密顿量 H(t)
-            H_a_t, H_b_t = self._build_hamiltonian()
+            t_now = current_time
+            t_next = current_time + self.dt
             
-            # 2. Crank-Nicolson 传播
-            # (S + i*dt/2 * H) * C(t+dt) = (S - i*dt/2 * H) * C(t)
+            # --- 计算外场势 V_ext ---
+            V_ext_now = 0.0
+            V_ext_next = 0.0
+            field_val = 0.0
             
-        # 2. 预估 C(t+dt) [使用 explicit 传播或简单的 CN]
-            # 这里为了方便复用代码，做一次标准的 CN 预估
-            LHS_a = self.S + 1j * (self.dt / 2.0) * H_a_t
-            RHS_a = self.S - 1j * (self.dt / 2.0) * H_a_t
-            C_alpha_pred = solve(LHS_a, RHS_a @ self.C_alpha)
+            if field_func is not None:
+                field_val = field_func(t_now)
+                E_next = field_func(t_next)
+                # V = E(t) * D
+                V_ext_now = field_val * D_laser_op
+                V_ext_next = E_next * D_laser_op
             
-            LHS_b = self.S + 1j * (self.dt / 2.0) * H_b_t
-            RHS_b = self.S - 1j * (self.dt / 2.0) * H_b_t
-            C_beta_pred = solve(LHS_b, RHS_b @ self.C_beta)
+            # --- 1. Predictor ---
+            H_a_tot_now = H_a_ks + V_ext_now
+            H_b_tot_now = H_b_ks + V_ext_now
             
-            # --- Corrector 步 ---
-            # 3. 使用预估的波函数构建 H(t+dt)
-            # 注意：我们需要临时把 C 替换成 C_pred 来算 H，算完再换回来，或者传参给 build_hamiltonian
-            # 这里我们临时保存真实 C
-            C_alpha_real, C_beta_real = self.C_alpha, self.C_beta
-            self.C_alpha, self.C_beta = C_alpha_pred, C_beta_pred
-            H_a_next, H_b_next = self._build_hamiltonian()
-            self.C_alpha, self.C_beta = C_alpha_real, C_beta_real # 恢复
+            LHS_a = self.S_sub + factor_plus * H_a_tot_now
+            RHS_a = self.S_sub + factor_minus * H_a_tot_now
+            c_a_pred = solve(LHS_a, RHS_a @ c_a_sub)
             
-            # 4. 取平均哈密顿量 H_avg = 0.5 * (H(t) + H(t+dt))
-            H_a_avg = 0.5 * (H_a_t + H_a_next)
-            H_b_avg = 0.5 * (H_b_t + H_b_next)
+            LHS_b = self.S_sub + factor_plus * H_b_tot_now
+            RHS_b = self.S_sub + factor_minus * H_b_tot_now
+            c_b_pred = solve(LHS_b, RHS_b @ c_b_sub)
             
-            # 5. 使用 H_avg 进行最终传播
-            LHS_a = self.S + 1j * (self.dt / 2.0) * H_a_avg
-            RHS_a = self.S - 1j * (self.dt / 2.0) * H_a_avg
-            self.C_alpha = solve(LHS_a, RHS_a @ self.C_alpha)
+            # --- 2. Corrector ---
+            # 还原预估波函数算 H_KS(t+dt)
+            C_a_pred_ao = self._from_subspace(c_a_pred)
+            C_b_pred_ao = self._from_subspace(c_b_pred)
+            H_a_ks_next, H_b_ks_next = self._build_hamiltonian_subspace(C_a_pred_ao, C_b_pred_ao)
             
-            LHS_b = self.S + 1j * (self.dt / 2.0) * H_b_avg
-            RHS_b = self.S - 1j * (self.dt / 2.0) * H_b_avg
-            self.C_beta = solve(LHS_b, RHS_b @ self.C_beta)
+            # 组合 H_total(t+dt)
+            H_a_tot_next = H_a_ks_next + V_ext_next
+            H_b_tot_next = H_b_ks_next + V_ext_next
             
-            # 3. 更新时间并记录观测值
+            # 取平均
+            H_a_avg = 0.5 * (H_a_tot_now + H_a_tot_next)
+            H_b_avg = 0.5 * (H_b_tot_now + H_b_tot_next)
+            
+            # 最终演化
+            LHS_a = self.S_sub + factor_plus * H_a_avg
+            RHS_a = self.S_sub + factor_minus * H_a_avg
+            c_a_sub = solve(LHS_a, RHS_a @ c_a_sub)
+            
+            LHS_b = self.S_sub + factor_plus * H_b_avg
+            RHS_b = self.S_sub + factor_minus * H_b_avg
+            c_b_sub = solve(LHS_b, RHS_b @ c_b_sub)
+            
+            # 滚动更新
+            H_a_ks = H_a_ks_next
+            H_b_ks = H_b_ks_next
+            
+            # --- 3. 记录 ---
             current_time += self.dt
             self.time_history.append(current_time)
             
-            # 计算偶极矩
-            mu = self._compute_current_dipole()
+            # 子空间快速计算偶极矩
+            mu = self._compute_dipole_subspace(c_a_sub, c_b_sub, D_sub_all)
             self.dipole_history.append(mu)
             
             if (step + 1) % print_interval == 0:
-                logging.info(f"Step {step+1}/{steps}: Time = {current_time:.2f} a.u., Dipole(z) = {mu[2]:.6f}")
+                logging.info(f"Step {step+1}: T={current_time:.2f}, E={field_val:.4f}, Mu_z={mu[2]:.6f}")
 
-    def _build_density_matrix(self, C: np.ndarray) -> np.ndarray:
-        """
-        构建复数密度矩阵 P_mu,nu = sum_i C_mu,i * C*_nu,i
-        """
-        # Einsum: C (n_basis, n_occ)
-        # P = C @ C.conj().T
-        return C @ C.conj().T
+        # 循环结束，还原系数
+        self.C_alpha = self._from_subspace(c_a_sub)
+        self.C_beta = self._from_subspace(c_b_sub)
 
-    def _build_hamiltonian(self) -> Tuple[np.ndarray, np.ndarray]:
+    def _build_hamiltonian_subspace(self, C_a_ao, C_b_ao):
         """
-        构建当前的 Kohn-Sham 哈密顿量 (绝热近似 ALDA)
-        H = H_core + J[rho] + V_xc[rho]
+        输入 AO 系数，返回子空间 Hamiltonian
         """
-        # 1. 构建密度矩阵 (复数)
-        P_alpha_complex = self._build_density_matrix(self.C_alpha)
-        P_beta_complex = self._build_density_matrix(self.C_beta)
+        # 1. 构建 AO 密度 (直接用输入的 AO 系数)
+        P_a_ao = (C_a_ao @ C_a_ao.conj().T).real
+        P_b_ao = (C_b_ao @ C_b_ao.conj().T).real
+        P_tot_ao = P_a_ao + P_b_ao
         
-        # 2. 获取实部密度矩阵用于构建势 (ALDA 近似只依赖粒子数密度)
-        # 注意：P 的对角元是实数 (粒子数)，非对角元是复数。
-        # 但 calculate_electron_density_on_grid 需要处理 angular_selection_matrix
-        # 只要 rho(r) 是实数即可。
-        # rho(r) = sum_mn P_mn phi_m phi_n。
-        # 因为 phi 是实函数，且 P 是 Hermitian，所以 sum P_mn ... 必然是实数。
-        # 我们取 P 的实部即可安全计算 J 和 rho。
-        P_alpha_real = P_alpha_complex.real
-        P_beta_real = P_beta_complex.real
-        P_total_real = P_alpha_real + P_beta_real
+        # 2. 构建 AO Hamiltonian
+        J = self.lsda_helper._build_coulomb_matrix(P_tot_ao, self.eri)
+        V_xc_a, V_xc_b, _, _, _ = self.lsda_helper._build_xc_potential_matrix(P_a_ao, P_b_ao)
         
-        # 3. 计算 Coulomb 矩阵 J (使用 helper)
-        J = self.lsda_helper._build_coulomb_matrix(P_total_real, self.eri)
+        H_a_ao = self.H_core_ao + J + V_xc_a
+        H_b_ao = self.H_core_ao + J + V_xc_b
         
-        # 4. 计算 XC 势 (使用 helper)
-        # 这里复用了 LSDA 中的逻辑，包含网格积分等
-        V_xc_alpha, V_xc_beta, _, _, _ = self.lsda_helper._build_xc_potential_matrix(P_alpha_real, P_beta_real)
-        
-        # 5. 组装 H
-        # H 是实对称矩阵 (在没有磁场/自旋轨道耦合且使用 ALDA 的情况下)
-        # 如果要包含激光场 E(t)*z，需要在这里加 V_ext
-        H_alpha = self.H_core + J + V_xc_alpha
-        H_beta = self.H_core + J + V_xc_beta
-        
-        return H_alpha, H_beta
+        # 3. 投影到子空间
+        if self.strict_diagonalize:
+            H_a_sub = self.X.T @ H_a_ao @ self.X
+            H_b_sub = self.X.T @ H_b_ao @ self.X
+        else:
+            H_a_sub = H_a_ao
+            H_b_sub = H_b_ao
+            
+        return H_a_sub, H_b_sub
 
     def _compute_current_dipole(self) -> np.ndarray:
-        """
-        计算当前时刻的偶极矩 expectation value
-        <mu> = Tr(P * D)
-        """
-        P_alpha = self._build_density_matrix(self.C_alpha)
-        P_beta = self._build_density_matrix(self.C_beta)
-        P_total = P_alpha + P_beta
-        
-        # D shape: (3, n, n), P shape: (n, n)
-        # Result: (3,)
-        # mu_i = sum_mn P_nm * D_i_mn = Tr(P @ D_i)
-        # 由于 D 是实对称，P 是 Hermitian，Tr(PD) 是实数
+        """直接使用 AO 系数计算偶极矩"""
+        P_a = (self.C_alpha @ self.C_alpha.conj().T).real
+        P_b = (self.C_beta @ self.C_beta.conj().T).real
+        P_tot = P_a + P_b
         
         mu = np.zeros(3)
         for i in range(3):
-            # complex trace -> real
-            val = np.sum(P_total * self.D[i].T) 
-            mu[i] = val.real
-            
+            mu[i] = np.sum(P_tot * self.D_ao[i].T)
         return mu
 
     def calculate_spectrum(self, kick_strength: float, damping: float = 0.005) -> Dict:
-        """
-        计算光吸收谱 (偶极强度的 Fourier 变换)
-        
-        S(omega) = (4 * pi * omega / (3 * c)) * Im[ alpha(omega) ]
-        其中 alpha(omega) = FT[ mu(t) - mu(0) ] / kick_strength
-        
-        Args:
-            kick_strength: 之前施加的 kick 强度
-            damping: 施加在时域信号上的指数阻尼因子 exp(-t/tau) (a.u.)，用于展宽峰值
-        
-        Returns:
-            Dict: {energy_ev, intensity}
-        """
-        # 1. 准备数据
+        """计算光吸收谱 (带符号修正)"""
         time = np.array(self.time_history)
-        # 假设 kick 沿 z 方向，分析 z 方向的偶极矩响应
-        # 如果要全谱，需要做三次计算 (x, y, z kick) 并平均
-        # 这里默认取 z 分量
         mu_z = np.array([d[2] for d in self.dipole_history])
         
-        # 减去基态偶极矩
         mu_induced = mu_z - mu_z[0]
-        
-        # 2. 应用阻尼 (Windowing)
-        # 避免截断误差导致的 Gibbs 振荡，同时引入 Lorentzian 展宽
         window = np.exp(-time * damping)
         signal = mu_induced * window
         
-        # 3. FFT
         n_points = len(signal)
-        # 补零以增加频域分辨率 (可选)
-        pad_factor = 4
-        n_fft = n_points * pad_factor
-        
-        freqs = fftfreq(n_fft, d=self.dt) * 2 * np.pi # 转换为角频率 omega (a.u.)
+        n_fft = n_points * 4
+        freqs = fftfreq(n_fft, d=self.dt) * 2 * np.pi
         f_signal = fft(signal, n=n_fft)
         
-        # 4. 计算极化率 alpha(omega) 和 强度 S(omega)
-        # S ~ omega * Im(alpha)
-        # 注意 fft 的结果需要归一化 dt
-        # alpha(omega) = (1/k) * integral(mu(t) e^iwt dt)
-        
-        alpha = f_signal * self.dt / kick_strength # 简单离散积分近似
-        
-        # 只取正频率部分
+        alpha = f_signal * self.dt / kick_strength
         mask = freqs > 0
         freqs_pos = freqs[mask]
-        alpha_pos = alpha[mask]
-        
-        # 强度 (任意单位，通常正比于 omega * Im(alpha))
-        intensity = freqs_pos * np.imag(alpha_pos)
-        
-        # 转换能量单位 to eV
-        energy_ev = freqs_pos * 27.2114
+        intensity = freqs_pos * np.imag(alpha[mask]) * -1.0 # 修正符号
         
         return {
-            'time': time,
-            'mu_induced': mu_induced,
-            'energy_ev': energy_ev,
-            'intensity': intensity,
-            'alpha_imag': np.imag(alpha_pos)
+            'time': time, 'mu_induced': mu_induced,
+            'energy_ev': freqs_pos * 27.2114, 'intensity': intensity
         }
-
-    def plot_spectrum(self, spectrum_data: Dict, filename: str = None):
-        """简单的绘图辅助函数"""
-        plt.figure(figsize=(10, 8))
-        
-        # 时域图
-        plt.subplot(2, 1, 1)
-        plt.plot(spectrum_data['time'], spectrum_data['mu_induced'])
-        plt.xlabel('Time (a.u.)')
-        plt.ylabel('Induced Dipole (z)')
-        plt.title('Time Domain Response')
-        plt.grid(True)
-        
-        # 频域图
-        plt.subplot(2, 1, 2)
-        plt.plot(spectrum_data['energy_ev'], spectrum_data['intensity'])
-        plt.xlabel('Energy (eV)')
-        plt.ylabel('Intensity (arb. units)')
-        plt.title('Absorption Spectrum')
-        plt.xlim(0, 50) # 通常关注的范围
-        plt.grid(True)
-        
-        plt.tight_layout()
-        if filename:
-            plt.savefig(filename)
-            logging.info(f"光谱图已保存至 {filename}")
-        else:
-            plt.show()
