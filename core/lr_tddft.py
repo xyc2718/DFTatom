@@ -199,8 +199,6 @@ class LinearResponseTDDFT:
         3. 核限幅 (Kernel Clamping): 防止非物理的强排斥/吸引。
         4. 正确的网格积分权重 (dV = 4pi * r^2 * dr)。
         """
-        import logging
-        import numpy as np
         
         # 确定当前的泛函类型
         func_type = getattr(self.lsda_helper, 'functional_type', 'lda').lower()

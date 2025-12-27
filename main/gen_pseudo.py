@@ -8,9 +8,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.makedirs(output_dir,exist_ok=True)
 from core import *
 all_results={}
-#basis_set = get_aug_cc_pvtz_basis('Al',radius_cutoff=10.0,mesh_size=1000,grid_type='log')
-basis_set = get_sto3g_basis('Al',radius_cutoff=8.0,grid_type='log',mesh_size=2000)
-#basis_set = get_sto3g_basis('Al',radius_cutoff=8.0,grid_type='log',mesh_size=3000)
+#basis_set = get_aug_cc_pvtz_basis('Al',radius_cutoff=10.0,mesh_size=1000,grid_type='log',uncontracted=True)
+basis_set = get_sto6g_basis('Al',radius_cutoff=8.0,grid_type='log',mesh_size=2000,uncontracted=True)
 integral=AtomicIntegrals(basis_set,13,real_basis=True, eri_cache=True)
 lsda_calc=AtomicLSDA(integral,damping_factor=0.7,max_iterations=200,strict_diagonalize=True)
 #lsda_calc=AtomicHartreeFock(integral,damping_factor=0.7,max_iterations=200)

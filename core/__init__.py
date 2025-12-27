@@ -1,6 +1,5 @@
-from .atomic_integrals import *
 from .basis_set import *
-from .pseudo import *
+from .atomic_integrals import *
 from .sto3g import *
 from .pseudo import *
 from .HF import *

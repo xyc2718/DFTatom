@@ -19,7 +19,7 @@ class PseudopotentialGenerator:
     完全适配非均匀网格（如对数网格）。
     """
 
-    def __init__(self, ks_results: KSResults, r_cuts: Dict[str, float] = None, spin='alpha', v_shift: float = 0.0, auto_v_shift=True):
+    def __init__(self, ks_results: KSResults, r_cuts: Dict[str, float] = None, spin='alpha', v_shift: float = 0.0, auto_v_shift=True,degeneracy_threshold=3):
         """
         Args:
             ks_results: 全电子 LSDA 计算结果对象
@@ -31,7 +31,7 @@ class PseudopotentialGenerator:
         self.r_grid = ks_results.integral_calc.r_grid
         self.spin = spin
         self.v_shift = v_shift
-        
+        self.degeneracy_threshold=degeneracy_threshold
         # 确保 r_grid 不含 0 点以避免除零 (通常对数网格第一个点也不是0，但防万一)
         self.r_safe = np.where(self.r_grid < 1e-12, 1e-12, self.r_grid)
         
@@ -262,7 +262,7 @@ class PseudopotentialGenerator:
             
             # 能量 Key
             e_curr = eps_main[i]
-            e_key = round(e_curr, 4) 
+            e_key = round(e_curr, self.degeneracy_threshold) 
             group_key = (l_curr, e_key)
             
             # 重构波函数 (使用主通道系数)

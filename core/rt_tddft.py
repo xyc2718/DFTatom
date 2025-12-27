@@ -72,7 +72,6 @@ class RealTimeTDDFT:
     def _compute_dipole_subspace(self, c_a_sub, c_b_sub, D_sub) -> np.ndarray:
         """
         在子空间计算偶极矩: Tr(P_sub @ D_sub)
-        比 AO 空间计算快得多
         """
         # 构建子空间密度
         P_a = (c_a_sub @ c_a_sub.conj().T).real
@@ -167,33 +166,17 @@ class RealTimeTDDFT:
         laser_dir_idx = dir_map[field_direction.lower()]
         D_laser_op = D_sub_all[laser_dir_idx]
 
-        #处理 Delta Kick (t=0 初始化)
         if kick_params:
-            k_str = kick_params.get('strength', 0.0)
-            k_dir = kick_params.get('direction', 'z')
-            idx = dir_map[k_dir.lower()]
-            D_kick = D_sub_all[idx]
-            
-            logging.info(f"应用 Delta Kick: strength={k_str}, dir={k_dir}")
-            
-            # (S - ik/2 D) C = (S + ik/2 D) C
-            factor = 1j * (k_str / 2.0)
-            LHS = self.S_sub - factor * D_kick
-            RHS = self.S_sub + factor * D_kick
-            
-            # 将当前系数投影到子空间 -> Kick -> 更新
+            self.apply_delta_kick(
+                strength=kick_params.get('strength', 0.0), 
+                direction=kick_params.get('direction', 'z')
+            )
             c_a_sub = self._to_subspace(self.C_alpha)
             c_b_sub = self._to_subspace(self.C_beta)
-            c_a_sub = solve(LHS, RHS @ c_a_sub)
-            c_b_sub = solve(LHS, RHS @ c_b_sub)
-            
-            # 更新类成员
-            self.C_alpha = self._from_subspace(c_a_sub)
-            self.C_beta = self._from_subspace(c_b_sub)
-            
-            # 重置历史
-            self.time_history = [0.0]
-            self.dipole_history = [self._compute_current_dipole()] # AO空间计算最准
+        else:
+            current_time = 0.0 if not self.time_history else self.time_history[-1]
+            c_a_sub = self._to_subspace(self.C_alpha)
+            c_b_sub = self._to_subspace(self.C_beta)
         
         current_time = 0.0 if not self.time_history else self.time_history[-1]
         
