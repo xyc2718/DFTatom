@@ -2,7 +2,7 @@
 
 ## 简介
 
-本程序实现了自旋极化的原子Hartree-Fock (HF)和局域自旋密度近似(LSDA)计算。支持STO-3G/6G,aug-cc-pvtz/pvdz等高斯基组和ABACUS格式的数值原子轨道基组+赝势。支持TM方法的赝势生成，RT-TDDFT/LR-TDDFT的计算
+本程序为复旦大学电子结构计算课程作业，实现了自旋极化的原子Hartree-Fock (HF)和局域自旋密度近似(LSDA)计算。支持STO-3G/6G,aug-cc-pvtz/pvdz等高斯基组和ABACUS格式的数值原子轨道基组+赝势。支持TM方法的赝势生成，RT-TDDFT/LR-TDDFT的计算
 
 ## 主要功能
 
